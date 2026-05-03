@@ -41,6 +41,7 @@
 #define FIRST_DATA_CHANNEL_OFFSET 1  
 #define FILENAME_BUFFER_SIZE 256
 #define NUM_STREAMS 4
+#define TILE_SIZE 256
 
 __managed__ float g_accumulated_centroids[MAX_CLUSTERS * IMAGE_DIMENSIONS];
 __managed__ int g_cluster_population[MAX_CLUSTERS];
@@ -54,17 +55,14 @@ __managed__ int g_cluster_population[MAX_CLUSTERS];
  */
 __device__ int find_nearest_cluster(const float* image_pixels, 
                                     const float* __restrict__ centroids, 
-                                    int num_clusters) {
+                                    int num_clusters,
+                                    float* partial_dists) {
     float minimum_distance = FLT_MAX;
     int closest_cluster_id = 0;
 
     for (int cluster_idx = 0; cluster_idx < num_clusters; cluster_idx++) {
-        float current_distance = 0.0f;
-        for (int dim_idx = 0; dim_idx < IMAGE_DIMENSIONS; dim_idx++) {
-            float difference = image_pixels[dim_idx] - centroids[cluster_idx 
-                * IMAGE_DIMENSIONS + dim_idx];
-            current_distance += (difference * difference);
-        }
+        float current_distance = partial_dists[cluster_idx];
+        
         if (current_distance < minimum_distance) {
             minimum_distance = current_distance;
             closest_cluster_id = cluster_idx;
@@ -87,21 +85,32 @@ __global__ void assignment_kernel(const float* device_pixels,
                                     int num_clusters, 
                                     int global_offset) {
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int local_id = threadIdx.x;
     if (thread_id >= image_count) return;
 
     extern __shared__ float shared_pixel_buffer[];
-    float* thread_local_pixels = 
-            &shared_pixel_buffer[local_id * IMAGE_DIMENSIONS];
+    float partial_dists[MAX_CLUSTERS];
+    for (int i = 0; i < num_clusters; i++) partial_dists[i] = 0.0f;
 
-    for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
-        thread_local_pixels[d] = 
-            device_pixels[thread_id * IMAGE_DIMENSIONS + d];
+    for (int chunk_start = 0; chunk_start < IMAGE_DIMENSIONS; chunk_start += TILE_SIZE) {
+        int current_tile = min(TILE_SIZE, IMAGE_DIMENSIONS - chunk_start);
+        
+        if (threadIdx.x < current_tile) {
+            shared_pixel_buffer[threadIdx.x] = device_pixels[thread_id * IMAGE_DIMENSIONS + chunk_start + threadIdx.x];
+        }
+        __syncthreads();
+
+        for (int cluster_idx = 0; cluster_idx < num_clusters; cluster_idx++) {
+            for (int i = 0; i < current_tile; i++) {
+                float val = shared_pixel_buffer[i];
+                float diff = val - device_centroids[cluster_idx * IMAGE_DIMENSIONS + chunk_start + i];
+                partial_dists[cluster_idx] += (diff * diff);
+            }
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     device_assignments[thread_id + global_offset] = 
-        find_nearest_cluster(thread_local_pixels, device_centroids, num_clusters);
+        find_nearest_cluster(NULL, device_centroids, num_clusters, partial_dists);
 }
 
 /**
@@ -241,7 +250,7 @@ void dispatch_gpu_step(float* device_pixels,
                         int* device_assignments, int batch_size, int clusters, 
                         int threads, int total_n, cudaStream_t stream, int offset) {
     int blocks = (batch_size + threads - 1) / threads;
-    size_t shared_size = (size_t)threads * IMAGE_DIMENSIONS * sizeof(float);
+    size_t shared_size = (size_t)TILE_SIZE * sizeof(float);
 
     assignment_kernel<<<blocks, threads, shared_size, stream>>>(device_pixels, 
         g_accumulated_centroids, device_assignments, batch_size, clusters, offset);
