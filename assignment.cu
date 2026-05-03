@@ -45,7 +45,7 @@ void export_to_csv(const char* file_path, const int* cluster_assignments,
     }
 
     fclose(f);
-    printf("Wrote %s\n", file_path);
+    // printf("Wrote %s\n", file_path);
 }
 
 
@@ -509,7 +509,7 @@ void load_cifar_dataset(const char* file_path, float* host_pixels,
         loaded_count++;
     }
     fclose(file_pointer);
-    printf("Loaded %d real images from disk.\n", loaded_count);
+    // printf("Loaded %d real images from disk.\n", loaded_count);
 
     for (int i = 0; i < num_images; i++) {
         int source_idx = i % loaded_count;
@@ -518,7 +518,7 @@ void load_cifar_dataset(const char* file_path, float* host_pixels,
     }
 
     free(base_buffer);
-    printf("Host buffer filled with %d images (using cyclic data).\n", 
+    // printf("Host buffer filled with %d images (using cyclic data).\n", 
                                                                 num_images);
 }
 
