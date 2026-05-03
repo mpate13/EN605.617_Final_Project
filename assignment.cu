@@ -9,7 +9,6 @@
 #define ITER 20
 
 #define WARP_SIZE 32
-#define THREADS_PER_BLOCK 128
 
 // ---------------- ERROR CHECK ----------------
 
@@ -86,20 +85,21 @@ __global__ void kmeans_warp_kernel(
     int* labels,
     float* sum,
     int* cnt,
-    int n)
+    int n,
+    int warps_per_block)
 {
-    int globalThread = blockIdx.x * blockDim.x + threadIdx.x;
-    int warpId = globalThread / WARP_SIZE;
-    int lane   = threadIdx.x % WARP_SIZE;
+    int lane = threadIdx.x & 31;
+    int warp_in_block = threadIdx.x >> 5;
 
-    if (warpId >= n) return;
+    int warp_id = blockIdx.x * warps_per_block + warp_in_block;
 
-    const float* xi = x + warpId * DIM;
+    if (warp_id >= n) return;
+
+    const float* xi = x + warp_id * DIM;
 
     float bestDist = 1e30f;
     int bestk = 0;
 
-    // each warp computes one point
     for (int k = 0; k < K; k++) {
 
         float partial = 0;
@@ -120,7 +120,7 @@ __global__ void kmeans_warp_kernel(
     }
 
     if (lane == 0) {
-        labels[warpId] = bestk;
+        labels[warp_id] = bestk;
         atomicAdd(&cnt[bestk], 1);
     }
 
@@ -131,8 +131,15 @@ __global__ void kmeans_warp_kernel(
 
 // ---------------- GPU DRIVER ----------------
 
-float gpu_kmeans(const float* x, float* c, int* labels, int n)
+float gpu_kmeans(const float* x, float* c, int* labels, int n, int block_size)
 {
+    if (block_size % 32 != 0) {
+        printf("ERROR: block_size must be multiple of 32\n");
+        exit(1);
+    }
+
+    int warps_per_block = block_size / 32;
+
     float *d_x, *d_c, *d_sum;
     int *d_cnt, *d_labels;
 
@@ -150,16 +157,21 @@ float gpu_kmeans(const float* x, float* c, int* labels, int n)
     CUDA_CHECK(cudaEventCreate(&stop));
     CUDA_CHECK(cudaEventRecord(start));
 
-    int warpPerBlock = THREADS_PER_BLOCK / WARP_SIZE;
-    int blocks = (n + warpPerBlock - 1) / warpPerBlock;
+    int blocks = (n + warps_per_block - 1) / warps_per_block;
 
     for (int it = 0; it < ITER; it++) {
 
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
-        kmeans_warp_kernel<<<blocks, THREADS_PER_BLOCK>>>(
-            d_x, d_c, d_labels, d_sum, d_cnt, n
+        kmeans_warp_kernel<<<blocks, block_size>>>(
+            d_x,
+            d_c,
+            d_labels,
+            d_sum,
+            d_cnt,
+            n,
+            warps_per_block
         );
 
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -212,6 +224,7 @@ int main(int argc, char** argv)
     }
 
     int n = atoi(argv[1]);
+    int block_size = atoi(argv[2]);
 
     float* x = (float*)malloc(n * DIM * sizeof(float));
     float* c1 = (float*)malloc(K * DIM * sizeof(float));
@@ -231,9 +244,9 @@ int main(int argc, char** argv)
     cpu_kmeans(x, c1, l1, n);
     float cpu_ms = (float)(clock() - t1) / CLOCKS_PER_SEC * 1000;
 
-    float gpu_ms = gpu_kmeans(x, c2, l2, n);
+    float gpu_ms = gpu_kmeans(x, c2, l2, n, block_size);
 
-    printf("N=%d\n", n);
+    printf("N=%d Block=%d\n", n, block_size);
     printf("CPU: %.2f ms\n", cpu_ms);
     printf("GPU: %.2f ms\n", gpu_ms);
     printf("Speedup: %.2fx\n", cpu_ms / gpu_ms);
