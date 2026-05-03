@@ -401,6 +401,7 @@ void export_benchmark_results(int* cpu_results,
 /**
  * HOST FUNCTION: allocate_host_resources
  * Handles the memory requests for the image buffer and result arrays.
+ * Using malloc to avoid system pinning limits.
  */
 void allocate_host_resources(int total_image_count, 
                              float** pixels, 
@@ -409,7 +410,7 @@ void allocate_host_resources(int total_image_count,
     size_t pixel_size = (size_t)total_image_count * IMAGE_DIMENSIONS * sizeof(float);
     size_t result_size = (size_t)total_image_count * sizeof(int);
 
-    cudaHostAlloc(pixels, pixel_size, cudaHostAllocDefault);
+    *pixels = (float*)malloc(pixel_size);
     *gpu_res = (int*)malloc(result_size);
     *cpu_res = (int*)malloc(result_size);
 
@@ -435,7 +436,7 @@ void initialize_dataset(float* host_pixel_buffer, int total_image_count) {
  * Ensures all heap memory is properly released.
  */
 void cleanup_host_resources(float* pixels, int* gpu_res, int* cpu_res) {
-    if (pixels) cudaFreeHost(pixels);
+    if (pixels) free(pixels);
     if (gpu_res) free(gpu_res);
     if (cpu_res) free(cpu_res);
 }
