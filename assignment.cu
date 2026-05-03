@@ -26,6 +26,29 @@
 
 
 // ============================================================
+// CSV EXPORT
+// ============================================================
+
+void export_to_csv(const char* filename, const int* assignments, int n)
+{
+    FILE* f = fopen(filename, "w");
+    if (!f) {
+        printf("Failed to open %s\n", filename);
+        return;
+    }
+
+    fprintf(f, "ImageID,ClusterID\n");
+
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "%d,%d\n", i, assignments[i]);
+    }
+
+    fclose(f);
+    printf("Wrote %s\n", filename);
+}
+
+
+// ============================================================
 // CPU BASELINE
 // ============================================================
 
@@ -81,7 +104,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
 
 
 // ============================================================
-// CENTROID UPDATE (MINIBATCH CORRECT VERSION)
+// MINIBATCH CENTROID UPDATE
 // ============================================================
 
 __global__ void update_centroids_minibatch(
@@ -106,7 +129,7 @@ __global__ void update_centroids_minibatch(
 
 
 // ============================================================
-// GPU KERNEL: ASSIGN + REDUCE
+// GPU KERNEL
 // ============================================================
 
 __global__ void kmeans_minibatch_kernel(
@@ -171,7 +194,7 @@ __global__ void kmeans_minibatch_kernel(
 
 
 // ============================================================
-// STANDARD DRIVER
+// GPU DRIVERS (UNCHANGED)
 // ============================================================
 
 float gpu_kmeans_standard(const float* x, float* c, int* labels, int n, int block_size)
@@ -200,16 +223,10 @@ float gpu_kmeans_standard(const float* x, float* c, int* labels, int n, int bloc
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
-        kmeans_minibatch_kernel<<<blocks, block_size>>>(
-            d_x, d_c, d_labels, d_sum, d_cnt, n
-        );
-
+        kmeans_minibatch_kernel<<<blocks, block_size>>>(d_x, d_c, d_labels, d_sum, d_cnt, n);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        update_centroids_minibatch<<<K, block_size>>>(
-            d_c, d_sum, d_cnt, 1.0f
-        );
-
+        update_centroids_minibatch<<<K, block_size>>>(d_c, d_sum, d_cnt, 1.0f);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -230,7 +247,7 @@ float gpu_kmeans_standard(const float* x, float* c, int* labels, int n, int bloc
 
 
 // ============================================================
-// MINI-BATCH DRIVER (FIXED)
+// MINIBATCH DRIVER
 // ============================================================
 
 float gpu_kmeans_minibatch(const float* x, float* c, int* labels, int n, int block_size)
@@ -275,10 +292,7 @@ float gpu_kmeans_minibatch(const float* x, float* c, int* labels, int n, int blo
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        update_centroids_minibatch<<<K, block_size>>>(
-            d_c, d_sum, d_cnt, lr
-        );
-
+        update_centroids_minibatch<<<K, block_size>>>(d_c, d_sum, d_cnt, lr);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
@@ -294,6 +308,28 @@ float gpu_kmeans_minibatch(const float* x, float* c, int* labels, int n, int blo
     cudaFree(d_cnt);
     cudaFree(d_labels);
 
+    return ms;
+}
+
+
+// ============================================================
+// CPU TIMER WRAPPER
+// ============================================================
+
+float cpu_kmeans_timed(const float* x, float* c, int* labels, int n)
+{
+    float* c_copy = (float*)malloc(K * DIM * sizeof(float));
+
+    for (int i = 0; i < K * DIM; i++)
+        c_copy[i] = c[i];
+
+    clock_t start = clock();
+    cpu_kmeans(x, c_copy, labels, n);
+    clock_t end = clock();
+
+    float ms = 1000.0f * (float)(end - start) / CLOCKS_PER_SEC;
+
+    free(c_copy);
     return ms;
 }
 
@@ -321,7 +357,9 @@ int main(int argc, char** argv)
 
     float *x = (float*)malloc((size_t)n * DIM * sizeof(float));
     float *c = (float*)malloc(K * DIM * sizeof(float));
-    int *labels = (int*)malloc(n * sizeof(int));
+
+    int *cpu_labels = (int*)malloc(n * sizeof(int));
+    int *gpu_labels = (int*)malloc(n * sizeof(int));
 
     srand(0);
     init(x, n);
@@ -329,30 +367,35 @@ int main(int argc, char** argv)
     for (int i = 0; i < K * DIM; i++)
         c[i] = x[i];
 
-    // ========================================================
-    // ALWAYS RUN CPU BASELINE
-    // ========================================================
-    float cpu_ms = cpu_kmeans_timed(x, c, labels, n);
+    // CPU
+    float cpu_ms = cpu_kmeans_timed(x, c, cpu_labels, n);
     printf("CPU Time: %.2f ms\n", cpu_ms);
 
-    // reset centroids for fair GPU comparison
+    char cpu_file[128];
+    sprintf(cpu_file, "cpu_n%d_b%d_%s.csv", n, block, mb ? "minibatch" : "standard");
+    export_to_csv(cpu_file, cpu_labels, n);
+
+    // reset centroids
     for (int i = 0; i < K * DIM; i++)
         c[i] = x[i];
 
-    // ========================================================
-    // RUN GPU
-    // ========================================================
+    // GPU
     float gpu_ms = mb ?
-        gpu_kmeans_minibatch(x, c, labels, n, block)
+        gpu_kmeans_minibatch(x, c, gpu_labels, n, block)
         :
-        gpu_kmeans_standard(x, c, labels, n, block);
+        gpu_kmeans_standard(x, c, gpu_labels, n, block);
 
     printf("Mode: %s\n", mb ? "MINI-BATCH" : "STANDARD");
     printf("GPU Time: %.2f ms\n", gpu_ms);
 
+    char gpu_file[128];
+    sprintf(gpu_file, "gpu_n%d_b%d_%s.csv", n, block, mb ? "minibatch" : "standard");
+    export_to_csv(gpu_file, gpu_labels, n);
+
     free(x);
     free(c);
-    free(labels);
+    free(cpu_labels);
+    free(gpu_labels);
 
     return 0;
 }
