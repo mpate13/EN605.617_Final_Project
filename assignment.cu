@@ -63,70 +63,59 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n) {
 
 // ---------------- GPU TILED KERNEL ----------------
 
-__global__ void kmeans_kernel(const float* __restrict__ x,
-                              float* __restrict__ c,
-                              int* labels,
-                              float* out_sum,
-                              int* out_cnt,
-                              int n) {
-
-    __shared__ float centroids[K * DIM];
-    __shared__ float local_sum[K * DIM];
-    __shared__ int local_cnt[K];
+__global__ void kmeans_kernel_fixed(
+    const float* __restrict__ x,
+    const float* __restrict__ c,
+    int* labels,
+    float* out_sum,
+    int* out_cnt,
+    int n)
+{
+    extern __shared__ float tile[];  // ONLY input tile
 
     int tid = threadIdx.x;
     int i = blockIdx.x * blockDim.x + tid;
 
-    // load centroids once per block
-    for (int k = tid; k < K * DIM; k += blockDim.x)
-        centroids[k] = c[k];
+    float* xi = tile + tid * DIM;
 
-    if (tid < K) {
-        local_cnt[tid] = 0;
-        for (int d = 0; d < DIM; d++)
-            local_sum[tid * DIM + d] = 0;
-    }
-
-    __syncthreads();
-
+    // load input tile (OK for shared memory)
     if (i < n) {
-
-        float best = 1e30f;
-        int bestk = 0;
-
-        // assign
-        for (int k = 0; k < K; k++) {
-            float d = 0;
-            for (int d_i = 0; d_i < DIM; d_i++) {
-                float diff = x[i * DIM + d_i] - centroids[k * DIM + d_i];
-                d += diff * diff;
-            }
-            if (d < best) {
-                best = d;
-                bestk = k;
-            }
-        }
-
-        labels[i] = bestk;
-
-        atomicAdd(&local_cnt[bestk], 1);
-
-        for (int d_i = 0; d_i < DIM; d_i++) {
-            atomicAdd(&local_sum[bestk * DIM + d_i],
-                      x[i * DIM + d_i]);
+        for (int d = 0; d < DIM; d++) {
+            xi[d] = x[i * DIM + d];
         }
     }
 
     __syncthreads();
 
-    // reduce block results
-    for (int k = tid; k < K; k += blockDim.x) {
-        atomicAdd(&out_cnt[k], local_cnt[k]);
+    if (i >= n) return;
 
+    // keep centroid reads in GLOBAL (cached by L2!)
+    float best = 1e30f;
+    int bestk = 0;
+
+    for (int k = 0; k < K; k++) {
+        float d = 0;
+
+        #pragma unroll 4
         for (int d_i = 0; d_i < DIM; d_i++) {
-            atomicAdd(&out_sum[k * DIM + d_i],
-                      local_sum[k * DIM + d_i]);
+            float diff = xi[d_i] - c[k * DIM + d_i];
+            d += diff * diff;
         }
+
+        if (d < best) {
+            best = d;
+            bestk = k;
+        }
+    }
+
+    labels[i] = bestk;
+
+    // SAFE global accumulation (no shared memory explosion)
+    atomicAdd(&out_cnt[bestk], 1);
+
+    for (int d_i = 0; d_i < DIM; d_i++) {
+        atomicAdd(&out_sum[bestk * DIM + d_i],
+                  xi[d_i]);
     }
 }
 
