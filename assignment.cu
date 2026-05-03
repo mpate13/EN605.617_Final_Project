@@ -190,3 +190,46 @@ float gpu_kmeans_warp(const float* x, float* c, int* labels, int n)
 
     return ms;
 }
+
+int main(int argc, char** argv)
+{
+    if (argc < 3) {
+        printf("Usage: %s <N> <block_size>\n", argv[0]);
+        return 1;
+    }
+
+    int n = atoi(argv[1]);
+
+    float* x = (float*)malloc(n * DIM * sizeof(float));
+    float* c1 = (float*)malloc(K * DIM * sizeof(float));
+    float* c2 = (float*)malloc(K * DIM * sizeof(float));
+    int* l1 = (int*)malloc(n * sizeof(int));
+    int* l2 = (int*)malloc(n * sizeof(int));
+
+    srand(0);
+    init(x, n);
+
+    for (int i = 0; i < K * DIM; i++) {
+        c1[i] = x[i];
+        c2[i] = x[i];
+    }
+
+    clock_t t1 = clock();
+    cpu_kmeans(x, c1, l1, n);
+    float cpu_ms = (float)(clock() - t1) / CLOCKS_PER_SEC * 1000;
+
+    float gpu_ms = gpu_kmeans_warp(x, c2, l2, n);
+
+    printf("N=%d\n", n);
+    printf("CPU: %.2f ms\n", cpu_ms);
+    printf("GPU: %.2f ms\n", gpu_ms);
+    printf("Speedup: %.2fx\n", cpu_ms / gpu_ms);
+
+    free(x);
+    free(c1);
+    free(c2);
+    free(l1);
+    free(l2);
+
+    return 0;
+}
