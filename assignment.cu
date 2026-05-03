@@ -122,7 +122,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     float *d_x[NUM_STREAMS];
     float *d_sum[NUM_STREAMS];
-    int *d_cnt[NUM_STREAMS];
+    float *d_cnt[NUM_STREAMS];
 
     float *d_c, *d_labels;
 
@@ -199,12 +199,12 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
         // ================= REDUCTION =================
         float *h_sum = (float*)calloc(K * DIM, sizeof(float));
-        int *h_cnt = (int*)calloc(K, sizeof(int));
+        float *h_cnt = (int*)calloc(K, sizeof(int));
 
         for (int s = 0; s < NUM_STREAMS; s++) {
 
             float *tmp_sum = (float*)malloc(K * DIM * sizeof(float));
-            int *tmp_cnt = (int*)malloc(K * sizeof(int));
+            float *tmp_cnt = (int*)malloc(K * sizeof(int));
 
             CUDA_CHECK(cudaMemcpy(tmp_sum, d_sum[s],
                 K * DIM * sizeof(float),
