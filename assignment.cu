@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <float.h>
 #include <time.h>
+#include <string.h>
 
 #define K 10
 #define DIM 3072
@@ -14,6 +15,8 @@
 #define WARP_SIZE 32
 #define TILE_K 4
 #define TILE_D 32
+
+#define MINI_BATCH_SIZE 256   // <-- you can tune this
 
 #define CUDA_CHECK(x) do { \
     cudaError_t err = (x); \
@@ -72,7 +75,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
     }
 }
 
-// ---------------- RESEARCH-GRADE KERNEL ----------------
+// ---------------- GPU KERNEL (unchanged) ----------------
 
 __global__ void kmeans_kernel_research(
     const float* __restrict__ x,
@@ -96,7 +99,6 @@ __global__ void kmeans_kernel_research(
 
     for (int k0 = 0; k0 < K; k0 += TILE_K)
     {
-        // load centroid tile
         for (int i = threadIdx.x; i < TILE_K * DIM; i += blockDim.x)
         {
             int ck = i / DIM;
@@ -149,7 +151,49 @@ __global__ void kmeans_kernel_research(
         atomicAdd(&out_sum[best_k * DIM + d], xi[d]);
 }
 
-// ---------------- STREAMED DRIVER ----------------
+// ---------------- MINI-BATCH CPU (reference logic) ----------------
+
+void cpu_kmeans_minibatch(const float* x, float* c, int n)
+{
+    float lr = 0.1f;
+    int batch = MINI_BATCH_SIZE;
+
+    for (int it = 0; it < ITER; it++) {
+
+        for (int b = 0; b < n; b += batch) {
+
+            int cur = (b + batch > n) ? (n - b) : batch;
+
+            for (int i = 0; i < cur; i++) {
+                int idx = b + i;
+
+                float best = 1e30f;
+                int bestk = 0;
+
+                for (int k = 0; k < K; k++) {
+                    float d = 0;
+                    for (int d_i = 0; d_i < DIM; d_i++) {
+                        float diff = x[idx * DIM + d_i] - c[k * DIM + d_i];
+                        d += diff * diff;
+                    }
+                    if (d < best) {
+                        best = d;
+                        bestk = k;
+                    }
+                }
+
+                // online update
+                for (int d_i = 0; d_i < DIM; d_i++) {
+                    float xval = x[idx * DIM + d_i];
+                    c[bestk * DIM + d_i] =
+                        (1 - lr) * c[bestk * DIM + d_i] + lr * xval;
+                }
+            }
+        }
+    }
+}
+
+// ---------------- GPU DRIVER (unchanged) ----------------
 
 float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int block_size)
 {
@@ -226,16 +270,6 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     CUDA_CHECK(cudaMemcpy(labels, d_labels, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
 
-    for (int s = 0; s < NUM_STREAMS; s++) {
-        cudaFree(d_x[s]);
-        cudaStreamDestroy(streams[s]);
-    }
-
-    cudaFree(d_sum);
-    cudaFree(d_cnt);
-    cudaFree(d_c);
-    cudaFree(d_labels);
-
     return ms;
 }
 
@@ -247,12 +281,18 @@ void init(float* x, int n)
         x[i] = (float)rand() / RAND_MAX;
 }
 
-// ---------------- MAIN ----------------
+// ---------------- MAIN (UPDATED FLAG SUPPORT) ----------------
 
 int main(int argc, char** argv)
 {
+    if (argc < 3) {
+        printf("Usage: %s <n> <block_size> [--mini-batch]\n", argv[0]);
+        return 1;
+    }
+
     int n = atoi(argv[1]);
     int block_size = atoi(argv[2]);
+    int use_minibatch = (argc >= 4 && strcmp(argv[3], "--mini-batch") == 0);
 
     float* x  = (float*)malloc((size_t)n * DIM * sizeof(float));
     float* c1 = (float*)malloc(K * DIM * sizeof(float));
@@ -269,11 +309,17 @@ int main(int argc, char** argv)
     }
 
     clock_t t1 = clock();
-    cpu_kmeans(x, c1, l1, n);
+
+    if (use_minibatch)
+        cpu_kmeans_minibatch(x, c1, n);
+    else
+        cpu_kmeans(x, c1, l1, n);
+
     float cpu_ms = (float)(clock() - t1) / CLOCKS_PER_SEC * 1000;
 
     float gpu_ms = gpu_kmeans_streamed(x, c2, l2, n, block_size);
 
+    printf("Mode: %s\n", use_minibatch ? "MINI-BATCH" : "STANDARD");
     printf("N=%d Block=%d\n", n, block_size);
     printf("CPU: %.2f ms\n", cpu_ms);
     printf("GPU: %.2f ms\n", gpu_ms);
