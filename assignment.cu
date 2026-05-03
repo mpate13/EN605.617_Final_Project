@@ -302,9 +302,18 @@ float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n,
         int current_chunk = (offset + chunk_size > total_n) ? (total_n - offset) : chunk_size;
         int s_idx = (offset / chunk_size) % NUM_STREAMS;
 
-        cudaMemcpy(device_pixel_buffer, host_pixels + (size_t)offset * IMAGE_DIMENSIONS, 
-            (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float), 
-            cudaMemcpyHostToDevice, streams[s_idx]);
+        if (used_pinned) {
+        cudaMemcpyAsync(device_pixel_buffer,
+                        host_pixels + (size_t)offset * IMAGE_DIMENSIONS,
+                        (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float),
+                        cudaMemcpyHostToDevice,
+                        streams[s_idx]);
+    } else {
+        cudaMemcpy(device_pixel_buffer,
+                host_pixels + (size_t)offset * IMAGE_DIMENSIONS,
+                (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float),
+                cudaMemcpyHostToDevice);
+    }
 
         // Iterate kernels on resident data
         for (int i = 0; i < MAX_ITERATIONS; i++) {
