@@ -17,14 +17,14 @@
         exit(1); \
     }
 
-// Procedural generation: Generates a chunk of data without storing it all
+// Procedural generation to avoid OOM for large N
 void generate_data_chunk(float* buffer, int n_elements) {
     for (int i = 0; i < n_elements * DIM; i++) {
         buffer[i] = (float)rand() / RAND_MAX;
     }
 }
 
-// ---------------- KERNELS (Kept Optimized) ----------------
+// ---------------- KERNELS ----------------
 
 __device__ __forceinline__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -57,6 +57,7 @@ __global__ void kmeans_assignment_kernel(const float* __restrict__ x, const floa
 __global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int* __restrict__ labels, float* sum, int* cnt, int n) {
     __shared__ float s_sum[K][SHARED_DIM_CHUNK];
     
+    // Tiled shared memory accumulation to reduce atomic contention
     for (int d_start = 0; d_start < DIM; d_start += SHARED_DIM_CHUNK) {
         for(int k=0; k<K; k++) {
             for(int d = threadIdx.x; d < SHARED_DIM_CHUNK; d += blockDim.x) s_sum[k][d] = 0.0f;
@@ -108,6 +109,10 @@ float gpu_kmeans(int n, int block_size, int mini_batch) {
     cudaStream_t streams[2];
     cudaStreamCreate(&streams[0]); cudaStreamCreate(&streams[1]);
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
     for (int it = 0; it < ITER; it++) {
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
@@ -119,9 +124,7 @@ float gpu_kmeans(int n, int block_size, int mini_batch) {
             int stream_idx = t % 2;
             int current_tile = (t == max_iters - 1 && (n % TILE_SIZE != 0)) ? (n % TILE_SIZE) : TILE_SIZE;
 
-            // Generate data on-the-fly (No large mallocs!)
             generate_data_chunk(h_buffer[stream_idx], current_tile);
-
             CUDA_CHECK(cudaMemcpyAsync(d_x[stream_idx], h_buffer[stream_idx], current_tile * DIM * sizeof(float), cudaMemcpyHostToDevice, streams[stream_idx]));
 
             int blocks = (current_tile + (block_size/WARP_SIZE) - 1) / (block_size/WARP_SIZE);
@@ -140,11 +143,15 @@ float gpu_kmeans(int n, int block_size, int mini_batch) {
             }
         }
     }
-    cudaFree(d_x[0]); cudaFree(d_x[1]); cudaFree(d_c); 
-    cudaFree(d_sum); cudaFree(d_cnt); cudaFree(d_labels[0]); cudaFree(d_labels[1]);
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms; cudaEventElapsedTime(&ms, start, stop);
+
+    // Cleanup
+    cudaFree(d_x[0]); cudaFree(d_x[1]); cudaFree(d_c); cudaFree(d_sum); cudaFree(d_cnt); cudaFree(d_labels[0]); cudaFree(d_labels[1]);
     cudaFreeHost(h_buffer[0]); cudaFreeHost(h_buffer[1]);
     free(c);
-    
     return ms;
 }
 
@@ -157,10 +164,7 @@ int main(int argc, char** argv) {
     int block_size = atoi(argv[2]);
     int mini_batch = (argc > 3 && strcmp(argv[3], "--mini-batch") == 0);
 
-    // Capture the return value
     float elapsed_ms = gpu_kmeans(n, block_size, mini_batch);
-    
-    // Print the result
     printf("GPU Time: %.2f ms\n", elapsed_ms);
     
     return 0;
