@@ -47,7 +47,7 @@ echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
 ./assignment 10000 128
 ./assignment 10000 256
 ./assignment 10000 512
-./assignment 10000 1024
+# ./assignment 10000 1024
 
 
 # ============================================================
