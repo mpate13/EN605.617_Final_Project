@@ -6,7 +6,7 @@ URL="https://www.cs.toronto.edu/~kriz/cifar-10-binary.tar.gz"
 
 if [ ! -f "$DATA_FILE" ]; then
     echo "Dataset not found. Downloading CIFAR-10..."
-    wget $URL -O $TAR_FILE
+    # wget $URL -O $TAR_FILE
     tar -xzf $TAR_FILE
     # Move the specific batch file to the current directory
     cp cifar-10-batches-bin/data_batch_1.bin .
