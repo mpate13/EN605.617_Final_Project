@@ -127,9 +127,14 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
     for (int i = 0; i < NUM_STREAMS; i++)
         CUDA_CHECK(cudaStreamCreate(&streams[i]));
 
-    float *d_x = NULL;
+    const int chunk = CHUNK_SIZE;
+
+    // 🔥 FIX: allocate ONCE
+    float *d_x;
     float *d_c, *d_sum;
     int *d_cnt, *d_labels;
+
+    CUDA_CHECK(cudaMalloc(&d_x, chunk * DIM * sizeof(float)));
 
     CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
@@ -146,9 +151,6 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     CUDA_CHECK(cudaEventRecord(start));
 
-    int blocks;
-    int chunk = CHUNK_SIZE;
-
     for (int it = 0; it < ITER; it++) {
 
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
@@ -159,9 +161,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
             int cur = (offset + chunk > n) ? (n - offset) : chunk;
             int s = (offset / chunk) % NUM_STREAMS;
 
-            if (d_x) cudaFree(d_x);
-
-            CUDA_CHECK(cudaMalloc(&d_x, cur * DIM * sizeof(float)));
+            // 🔥 FIX: reuse same buffer, no cudaMalloc here
 
             CUDA_CHECK(cudaMemcpyAsync(
                 d_x,
@@ -171,7 +171,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
                 streams[s]
             ));
 
-            blocks = (cur + block_size - 1) / block_size;
+            int blocks = (cur + block_size - 1) / block_size;
 
             assign_kernel<<<blocks, block_size, 0, streams[s]>>>(
                 d_x,
@@ -190,7 +190,6 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // copy updated centroids back for next iteration
         CUDA_CHECK(cudaMemcpy(c, d_c,
             K * DIM * sizeof(float),
             cudaMemcpyDeviceToHost));
