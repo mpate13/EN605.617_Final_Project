@@ -140,17 +140,28 @@ float gpu_kmeans(int n, int block_size, int mini_batch) {
             }
         }
     }
-    // Cleanup... (Free everything)
-    return 0;
+    cudaFree(d_x[0]); cudaFree(d_x[1]); cudaFree(d_c); 
+    cudaFree(d_sum); cudaFree(d_cnt); cudaFree(d_labels[0]); cudaFree(d_labels[1]);
+    cudaFreeHost(h_buffer[0]); cudaFreeHost(h_buffer[1]);
+    free(c);
+    
+    return ms;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) return 1;
+    if (argc < 3) {
+        printf("Usage: %s <N> <block_size> [--mini-batch]\n", argv[0]); 
+        return 1; 
+    }
     int n = atoi(argv[1]);
     int block_size = atoi(argv[2]);
     int mini_batch = (argc > 3 && strcmp(argv[3], "--mini-batch") == 0);
 
-    // NOTICE: No giant malloc for 1M images here. Memory is safe!
-    gpu_kmeans(n, block_size, mini_batch);
+    // Capture the return value
+    float elapsed_ms = gpu_kmeans(n, block_size, mini_batch);
+    
+    // Print the result
+    printf("GPU Time: %.2f ms\n", elapsed_ms);
+    
     return 0;
 }
