@@ -11,6 +11,8 @@
 #define NUM_STREAMS 4
 #define CHUNK_SIZE 50000
 
+#define WARP_SIZE 32
+
 #define CUDA_CHECK(x) \
 if ((x) != cudaSuccess) { \
     printf("CUDA ERROR: %s (%s:%d)\n", \
@@ -27,7 +29,6 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
 
     for (int it = 0; it < ITER; it++) {
 
-        // assign
         for (int i = 0; i < n; i++) {
             float best = 1e30f;
             int bestk = 0;
@@ -46,14 +47,12 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
             labels[i] = bestk;
         }
 
-        // reset
         for (int k = 0; k < K; k++) {
             cnt[k] = 0;
             for (int d_i = 0; d_i < DIM; d_i++)
                 tmp[k * DIM + d_i] = 0.0f;
         }
 
-        // accumulate
         for (int i = 0; i < n; i++) {
             int k = labels[i];
             cnt[k]++;
@@ -62,7 +61,6 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
             }
         }
 
-        // normalize
         for (int k = 0; k < K; k++) {
             if (cnt[k] == 0) continue;
             for (int d_i = 0; d_i < DIM; d_i++) {
@@ -72,9 +70,23 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
     }
 }
 
-// ---------------- GPU KERNEL ----------------
+// ---------------- WARP REDUCTION HELPERS ----------------
 
-__global__ void kmeans_kernel_hpc(
+__device__ __forceinline__ float warpReduceSum(float val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ int warpReduceInt(int val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+// ---------------- WARP-AGGREGATED KERNEL ----------------
+
+__global__ void kmeans_kernel_warp(
     const float* __restrict__ x,
     const float* __restrict__ c,
     int* labels,
@@ -82,7 +94,11 @@ __global__ void kmeans_kernel_hpc(
     int* out_cnt,
     int n)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+    int warp_id = tid / WARP_SIZE;
+    int lane = tid % WARP_SIZE;
+
     if (i >= n) return;
 
     const float* xi = &x[i * DIM];
@@ -90,6 +106,7 @@ __global__ void kmeans_kernel_hpc(
     float best = 1e30f;
     int bestk = 0;
 
+    // ---------------- ASSIGN ----------------
     for (int k = 0; k < K; k++) {
         float d = 0;
         const float* ck = &c[k * DIM];
@@ -108,10 +125,38 @@ __global__ void kmeans_kernel_hpc(
 
     labels[i] = bestk;
 
-    atomicAdd(&out_cnt[bestk], 1);
+    // ---------------- WARP LOCAL REDUCTION ----------------
+    extern __shared__ float shared[];
+    float* s_sum = shared;
+    int* s_cnt = (int*)&s_sum[K * DIM];
 
+    for (int d_i = tid; d_i < K * DIM; d_i += blockDim.x)
+        s_sum[d_i] = 0.0f;
+
+    for (int k = tid; k < K; k += blockDim.x)
+        s_cnt[k] = 0;
+
+    __syncthreads();
+
+    // accumulate locally (no atomics yet)
+    atomicAdd(&s_cnt[bestk], 1);
     for (int d_i = 0; d_i < DIM; d_i++) {
-        atomicAdd(&out_sum[bestk * DIM + d_i], xi[d_i]);
+        atomicAdd(&s_sum[bestk * DIM + d_i], xi[d_i]);
+    }
+
+    __syncthreads();
+
+    // ---------------- WARP → GLOBAL REDUCTION ----------------
+    if (lane == 0) {
+        for (int k = warp_id; k < K; k += (blockDim.x / WARP_SIZE)) {
+
+            atomicAdd(&out_cnt[k], s_cnt[k]);
+
+            for (int d_i = 0; d_i < DIM; d_i++) {
+                atomicAdd(&out_sum[k * DIM + d_i],
+                          s_sum[k * DIM + d_i]);
+            }
+        }
     }
 }
 
@@ -123,13 +168,12 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     float *d_x[NUM_STREAMS];
     float *d_sum;
-    int *d_cnt;        // ✅ MUST be int*
+    int *d_cnt;
     float *d_c;
-    int *d_labels;     // ✅ MUST be int*
+    int *d_labels;
 
     int chunk = CHUNK_SIZE;
 
-    // allocations
     for (int s = 0; s < NUM_STREAMS; s++) {
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
         CUDA_CHECK(cudaMalloc(&d_x[s], chunk * DIM * sizeof(float)));
@@ -152,11 +196,9 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
-        for (int offset = 0; offset < n; offset += chunk)
-        {
-            int cur = (offset + chunk > n) ? (n - offset) : chunk;
-            if (cur <= 0) break;
+        for (int offset = 0; offset < n; offset += chunk) {
 
+            int cur = (offset + chunk > n) ? (n - offset) : chunk;
             int s = (offset / chunk) % NUM_STREAMS;
 
             CUDA_CHECK(cudaMemcpyAsync(
@@ -169,7 +211,9 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
             int blocks = (cur + block_size - 1) / block_size;
 
-            kmeans_kernel_hpc<<<blocks, block_size, 0, streams[s]>>>(
+            size_t smem = K * DIM * sizeof(float) + K * sizeof(int);
+
+            kmeans_kernel_warp<<<blocks, block_size, smem, streams[s]>>>(
                 d_x[s],
                 d_c,
                 d_labels + offset,
