@@ -674,30 +674,30 @@ void print_report(int n, int block, int mb, float cpu, float gpu) {
     printf("==================================================\n\n");
 }
 
-void dump_features_for_pca(const char* filename,
-                           const float* x,
-                           const int* labels,
-                           int n) {
-    FILE* f = fopen(filename, "wb");
-    if (!f) {
-        printf("Failed to open PCA export file: %s\n", filename);
-        return;
-    }
+// void dump_features_for_pca(const char* filename,
+//                            const float* x,
+//                            const int* labels,
+//                            int n) {
+//     FILE* f = fopen(filename, "wb");
+//     if (!f) {
+//         printf("Failed to open PCA export file: %s\n", filename);
+//         return;
+//     }
 
-    // Write metadata
-    fwrite(&n, sizeof(int), 1, f);
-    fwrite(&DIM, sizeof(int), 1, f);
+//     // Write metadata
+//     fwrite(&n, sizeof(int), 1, f);
+//     fwrite(&DIM, sizeof(int), 1, f);
 
-    // Write labels
-    fwrite(labels, sizeof(int), n, f);
+//     // Write labels
+//     fwrite(labels, sizeof(int), n, f);
 
-    // Write feature vectors (n × DIM)
-    fwrite(x, sizeof(float), (size_t)n * DIM, f);
+//     // Write feature vectors (n × DIM)
+//     fwrite(x, sizeof(float), (size_t)n * DIM, f);
 
-    fclose(f);
+//     fclose(f);
 
-    printf("PCA export written to %s\n", filename);
-}
+//     printf("PCA export written to %s\n", filename);
+// }
 
 int main(int argc, char** argv) {
     if (argc < 3) { print_usage(argv[0]); return 1; }
@@ -725,8 +725,8 @@ int main(int argc, char** argv) {
     print_report(n, block, mb, cpu_ms, gpu_ms);
 
     // dump_features_for_pca("features.bin", x, gpu_labels, n);
-    dump_features_for_pca("cpu_features.bin", x, cpu_labels, n);
-    dump_features_for_pca("gpu_features.bin", x, gpu_labels, n);    
+    // dump_features_for_pca("cpu_features.bin", x, cpu_labels, n);
+    // dump_features_for_pca("gpu_features.bin", x, gpu_labels, n);    
 
     free(x); free(c);
     free(cpu_labels); free(gpu_labels);
