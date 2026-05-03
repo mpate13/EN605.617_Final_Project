@@ -3,25 +3,21 @@
 #include <cuda_runtime.h>
 #include <float.h>
 #include <string.h>
-#include <time.h>
 
 #define K 10
 #define DIM 3072
 #define ITER 20
 #define WARP_SIZE 32
-#define TILE_SIZE 65536 // Max images per GPU upload
+#define TILE_SIZE 16384 // Reduced tile size to guarantee VRAM headroom
 
-// ---------------- ERROR CHECK ----------------
 #define CUDA_CHECK(x) \
     if ((x) != cudaSuccess) { \
-        printf("CUDA ERROR: %s (%s:%d)\n", \
-        cudaGetErrorString(x), __FILE__, __LINE__); \
+        printf("CUDA ERROR: %s (%s:%d)\n", cudaGetErrorString(x), __FILE__, __LINE__); \
         exit(1); \
     }
 
 // ---------------- DEVICE FUNCTIONS ----------------
-__device__ __forceinline__
-float warpReduceSum(float val) {
+__device__ __forceinline__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
@@ -29,12 +25,8 @@ float warpReduceSum(float val) {
 
 // ---------------- KERNELS ----------------
 
-__global__ void kmeans_assignment_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ c,
-    int* labels,
-    int n) 
-{
+// Optimized Assignment Kernel
+__global__ void kmeans_assignment_kernel(const float* __restrict__ x, const float* __restrict__ c, int* labels, int n) {
     int warp_id = blockIdx.x * (blockDim.x / WARP_SIZE) + (threadIdx.x / WARP_SIZE);
     int lane = threadIdx.x % WARP_SIZE;
     if (warp_id >= n) return;
@@ -51,23 +43,16 @@ __global__ void kmeans_assignment_kernel(
             partial += diff * diff;
         }
         partial = warpReduceSum(partial);
-        if (lane == 0) {
-            if (partial < bestDist) {
-                bestDist = partial;
-                bestk = k;
-            }
+        if (lane == 0 && partial < bestDist) {
+            bestDist = partial;
+            bestk = k;
         }
     }
     if (lane == 0) labels[warp_id] = bestk;
 }
 
-__global__ void kmeans_accumulate_kernel(
-    const float* __restrict__ x,
-    const int* __restrict__ labels,
-    float* sum,
-    int* cnt,
-    int n) 
-{
+// Accumulation Kernel (Atomic Add is efficient on T4 if contention is low)
+__global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int* __restrict__ labels, float* sum, int* cnt, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
@@ -80,40 +65,54 @@ __global__ void kmeans_accumulate_kernel(
 
 // ---------------- GPU DRIVER ----------------
 
-float gpu_kmeans(const float* x, float* c, int n, int block_size, int mini_batch)
-{
-    float *d_x, *d_c, *d_sum;
-    int *d_cnt, *d_labels;
+float gpu_kmeans(const float* host_x, float* c, int n, int block_size, int mini_batch) {
+    float *d_x[2], *d_sum, *d_c;
+    int *d_labels[2], *d_cnt;
 
-    int actual_tile = (n < TILE_SIZE) ? n : TILE_SIZE;
-    CUDA_CHECK(cudaMalloc(&d_x, actual_tile * DIM * sizeof(float)));
+    // Pinned memory for faster transfer
+    float *h_buffer[2];
+    cudaHostAlloc(&h_buffer[0], TILE_SIZE * DIM * sizeof(float), cudaHostAllocDefault);
+    cudaHostAlloc(&h_buffer[1], TILE_SIZE * DIM * sizeof(float), cudaHostAllocDefault);
+
+    CUDA_CHECK(cudaMalloc(&d_x[0], TILE_SIZE * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_x[1], TILE_SIZE * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_labels, actual_tile * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_labels[0], TILE_SIZE * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_labels[1], TILE_SIZE * sizeof(int)));
+
+    cudaStream_t streams[2];
+    cudaStreamCreate(&streams[0]); cudaStreamCreate(&streams[1]);
 
     cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+    cudaEventRecord(start);
 
     for (int it = 0; it < ITER; it++) {
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
 
-        int max_iters = mini_batch ? 1 : (n + actual_tile - 1) / actual_tile;
+        int max_iters = mini_batch ? 1 : (n + TILE_SIZE - 1) / TILE_SIZE;
 
         for (int t = 0; t < max_iters; t++) {
-            int offset = mini_batch ? (rand() % (n - actual_tile)) : (t * actual_tile);
-            
-            CUDA_CHECK(cudaMemcpy(d_x, x + (offset * DIM), actual_tile * DIM * sizeof(float), cudaMemcpyHostToDevice));
+            int stream_idx = t % 2;
+            int offset = mini_batch ? (rand() % (n - TILE_SIZE)) : (t * TILE_SIZE);
+            int current_tile = (offset + TILE_SIZE > n) ? (n - offset) : TILE_SIZE;
 
-            int blocks = (actual_tile + (block_size/WARP_SIZE) - 1) / (block_size/WARP_SIZE);
-            kmeans_assignment_kernel<<<blocks, block_size>>>(d_x, d_c, d_labels, actual_tile);
-            
-            kmeans_accumulate_kernel<<< (actual_tile + 255)/256, 256 >>>(d_x, d_labels, d_sum, d_cnt, actual_tile);
+            memcpy(h_buffer[stream_idx], host_x + (offset * DIM), current_tile * DIM * sizeof(float));
+
+            CUDA_CHECK(cudaMemcpyAsync(d_x[stream_idx], h_buffer[stream_idx], current_tile * DIM * sizeof(float), cudaMemcpyHostToDevice, streams[stream_idx]));
+
+            int blocks = (current_tile + (block_size/WARP_SIZE) - 1) / (block_size/WARP_SIZE);
+            kmeans_assignment_kernel<<<blocks, block_size, 0, streams[stream_idx]>>>(d_x[stream_idx], d_c, d_labels[stream_idx], current_tile);
+            kmeans_accumulate_kernel<<< (current_tile + 255)/256, 256, 0, streams[stream_idx] >>>(d_x[stream_idx], d_labels[stream_idx], d_sum, d_cnt, current_tile);
         }
 
+        cudaDeviceSynchronize(); // Ensure kernel finishes before reading back
+        
+        // Final centroid update
         float h_sum[K * DIM]; int h_cnt[K];
         CUDA_CHECK(cudaMemcpy(h_sum, d_sum, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_cnt, d_cnt, K * sizeof(int), cudaMemcpyDeviceToHost));
@@ -127,37 +126,29 @@ float gpu_kmeans(const float* x, float* c, int n, int block_size, int mini_batch
 
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms; CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    
-    cudaFree(d_x); cudaFree(d_c); cudaFree(d_sum); cudaFree(d_cnt); cudaFree(d_labels);
+    float ms; cudaEventElapsedTime(&ms, start, stop);
+
+    // Cleanup
+    cudaFree(d_x[0]); cudaFree(d_x[1]); cudaFree(d_c); cudaFree(d_sum); cudaFree(d_cnt); cudaFree(d_labels[0]); cudaFree(d_labels[1]);
+    cudaFreeHost(h_buffer[0]); cudaFreeHost(h_buffer[1]);
     return ms;
 }
 
-// ---------------- INIT & MAIN ----------------
-
-void init(float* x, int n) {
-    for (int i = 0; i < n * DIM; i++) x[i] = (float)rand() / RAND_MAX;
-}
-
 int main(int argc, char** argv) {
-    if (argc < 3) { printf("Usage: %s <N> <block_size> [--mini-batch]\n", argv[0]); return 1; }
-
+    if (argc < 3) return 1;
     int n = atoi(argv[1]);
     int block_size = atoi(argv[2]);
-    int mini_batch = 0;
-    for(int i = 3; i < argc; i++) {
-        if (strcmp(argv[i], "--mini-batch") == 0) mini_batch = 1;
-    }
+    int mini_batch = (argc > 3 && strcmp(argv[3], "--mini-batch") == 0);
 
     float* x = (float*)malloc(n * DIM * sizeof(float));
-    float* c2 = (float*)malloc(K * DIM * sizeof(float));
-    init(x, n);
-    for (int i = 0; i < K * DIM; i++) c2[i] = x[i];
+    float* c = (float*)malloc(K * DIM * sizeof(float));
+    for(int i=0; i<n*DIM; i++) x[i] = (float)rand()/RAND_MAX;
+    for(int i=0; i<K*DIM; i++) c[i] = x[i];
 
-    float gpu_ms = gpu_kmeans(x, c2, n, block_size, mini_batch);
-    
-    printf("GPU: %.2f ms\n", gpu_ms);
+    printf("Starting GPU Kernel...\n");
+    float ms = gpu_kmeans(x, c, n, block_size, mini_batch);
+    printf("GPU Time: %.2f ms\n", ms);
 
-    free(x); free(c2);
+    free(x); free(c);
     return 0;
 }
