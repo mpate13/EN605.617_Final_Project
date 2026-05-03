@@ -23,7 +23,7 @@ if ((x) != cudaSuccess) { \
 void cpu_kmeans(const float* x, float* c, int* labels, int n)
 {
     float tmp[K * DIM];
-    int cnt[K];
+    int cnt[K];   // ✅ must be int
 
     for (int it = 0; it < ITER; it++) {
 
@@ -69,8 +69,6 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
 }
 
 // ---------------- FIXED KERNEL ----------------
-// ✔ no giant shared memory
-// ✔ warp-safe global atomics only
 
 __global__ void kmeans_kernel_hpc(
     const float* __restrict__ x,
@@ -113,7 +111,7 @@ __global__ void kmeans_kernel_hpc(
     }
 }
 
-// ---------------- STREAMED DRIVER (FIXED) ----------------
+// ---------------- STREAMED DRIVER ----------------
 
 float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int block_size)
 {
@@ -121,7 +119,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     float *d_x[NUM_STREAMS];
     float *d_sum;
-    int *d_cnt;
+    int *d_cnt;   // ✅ FIX: int*, not float*
     float *d_c, *d_labels;
 
     int chunk = CHUNK_SIZE;
@@ -132,7 +130,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
     }
 
     CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));   // ✅ correct type
     CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_labels, (size_t)n * sizeof(int)));
 
@@ -219,11 +217,11 @@ int main(int argc, char** argv)
     int n = atoi(argv[1]);
     int block_size = atoi(argv[2]);
 
-    float* x = (float*)malloc((size_t)n * DIM * sizeof(float));
+    float* x  = (float*)malloc((size_t)n * DIM * sizeof(float));
     float* c1 = (float*)malloc(K * DIM * sizeof(float));
     float* c2 = (float*)malloc(K * DIM * sizeof(float));
-    int* l1 = (int*)malloc((size_t)n * sizeof(int));
-    int* l2 = (int*)malloc((size_t)n * sizeof(int));
+    int* l1   = (int*)malloc((size_t)n * sizeof(int));
+    int* l2   = (int*)malloc((size_t)n * sizeof(int));
 
     srand(0);
     init(x, n);
