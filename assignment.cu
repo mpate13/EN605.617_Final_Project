@@ -16,6 +16,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
    }
 }
 
+void export_to_csv(const char* filename, const int* assignments, int total_images);
+
 /**
  * CIFAR-10 K-MEANS CLUSTERING: PERFORMANCE BENCHMARK & ARCHITECTURAL EVOLUTION
  * ----------------------------------------------------------------------------
@@ -53,67 +55,54 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 #define FIRST_DATA_CHANNEL_OFFSET 1  
 #define FILENAME_BUFFER_SIZE 256
 #define NUM_STREAMS 4
+#define TILE_SIZE 1024
 
 __managed__ float g_accumulated_centroids[MAX_CLUSTERS * IMAGE_DIMENSIONS];
+__managed__ float g_centroids[MAX_CLUSTERS * IMAGE_DIMENSIONS];
 __managed__ int g_cluster_population[MAX_CLUSTERS];
 
-
-/**
- * DEVICE FUNCTION: find_nearest_cluster
- * Performs an L2-norm (Euclidean) distance comparison between a single image 
- * vector and all available cluster centroids using the Read-Only Cache.
- * Returns the index of the cluster with the minimum distance.
- */
-__device__ int find_nearest_cluster(const float* image_pixels, 
-                                    const float* __restrict__ centroids, 
-                                    int num_clusters) {
-    float minimum_distance = FLT_MAX;
-    int closest_cluster_id = 0;
-
-    for (int cluster_idx = 0; cluster_idx < num_clusters; cluster_idx++) {
-        float current_distance = 0.0f;
-        for (int dim_idx = 0; dim_idx < IMAGE_DIMENSIONS; dim_idx++) {
-            float difference = image_pixels[dim_idx] - centroids[cluster_idx 
-                * IMAGE_DIMENSIONS + dim_idx];
-            current_distance += (difference * difference);
-        }
-        if (current_distance < minimum_distance) {
-            minimum_distance = current_distance;
-            closest_cluster_id = cluster_idx;
-        }
-    }
-    return closest_cluster_id;
-}
 
 /**
  * KERNEL: assignment_kernel
  * Assignment Phase: Assigns images to clusters. 
  * To minimize Global Memory transactions, this kernel stages the 
- * high-dimensional image data into Shared Memory (shared_pixel_buffer)
+ * high-dimensional image data into shared_pixel_buffer
  * before calling the distance calculation logic.
  */
-__global__ void assignment_kernel(const float* device_pixels, 
-                                    const float* device_centroids,
-                                    int* device_assignments, 
-                                    int image_count, 
-                                    int num_clusters, 
-                                    int global_offset) {
-    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int local_id = threadIdx.x;
-    if (thread_id >= image_count) return;
+__global__ void assignment_kernel(
+    const float* device_pixels,
+    const float* device_centroids,
+    int* device_assignments,
+    int image_count,
+    int num_clusters,
+    int global_offset)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= image_count) return;
 
-    extern __shared__ float shared_pixel_buffer[];
-    float* thread_local_pixels = 
-            &shared_pixel_buffer[local_id * IMAGE_DIMENSIONS];
+    float min_dist = FLT_MAX;
+    int best_cluster = 0;
 
-    for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
-        thread_local_pixels[d] = 
-            device_pixels[thread_id * IMAGE_DIMENSIONS + d];
+    for (int c = 0; c < num_clusters; c++) {
+
+        float dist = 0.0f;
+
+        // compute distance from image i to cluster c
+        for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
+            float diff =
+                device_pixels[i * IMAGE_DIMENSIONS + d] -
+                device_centroids[c * IMAGE_DIMENSIONS + d];
+
+            dist += diff * diff;
+        }
+
+        if (dist < min_dist) {
+            min_dist = dist;
+            best_cluster = c;
+        }
     }
-    __syncthreads();
 
-    device_assignments[thread_id + global_offset] = 
-        find_nearest_cluster(thread_local_pixels, device_centroids, num_clusters);
+    device_assignments[i + global_offset] = best_cluster;
 }
 
 /**
@@ -133,10 +122,12 @@ __global__ void update_kernel(const float* device_pixels,
     int assigned_cluster = device_assignments[global_image_idx];
 
     atomicAdd(&g_cluster_population[assigned_cluster], 1);
+
     for (int dim_idx = 0; dim_idx < IMAGE_DIMENSIONS; dim_idx++) {
-        atomicAdd(&g_accumulated_centroids[assigned_cluster * IMAGE_DIMENSIONS 
-            + dim_idx], 
-                  device_pixels[thread_id * IMAGE_DIMENSIONS + dim_idx]);
+        atomicAdd(
+            &g_accumulated_centroids[assigned_cluster * IMAGE_DIMENSIONS + dim_idx],
+            device_pixels[thread_id * IMAGE_DIMENSIONS + dim_idx]
+        );
     }
 }
 
@@ -151,14 +142,33 @@ __global__ void finalize_centroids_kernel(int num_clusters) {
     if (cluster_idx >= num_clusters) return;
 
     int current_population = g_cluster_population[cluster_idx];
+
     if (current_population > 0) {
         for (int dim_idx = 0; dim_idx < IMAGE_DIMENSIONS; dim_idx++) {
             int offset = cluster_idx * IMAGE_DIMENSIONS + dim_idx;
-            g_accumulated_centroids[offset] /= (float)current_population;
+            g_centroids[offset] =
+                g_accumulated_centroids[offset] / (float)current_population;
         }
-        g_cluster_population[cluster_idx] = 0; 
+    }
+
+    g_cluster_population[cluster_idx] = 0;
+}
+
+/**
+ * KERENEL: reset_centroids_kernel
+ * Reset centroid buffers before accumulation per iteration.
+ */
+__global__ void reset_centroids_kernel() {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < MAX_CLUSTERS * IMAGE_DIMENSIONS) {
+        g_accumulated_centroids[i] = 0.0f;
+    }
+    if (i < MAX_CLUSTERS) {
+        g_cluster_population[i] = 0;
     }
 }
+
 
 /**
  * HOST FUNCTION: export_to_csv
@@ -170,10 +180,12 @@ void export_to_csv(const char* filename, const int* assignments,
                     int total_images) {
     FILE* file_pointer = fopen(filename, "w");
     if (!file_pointer) return;
+
     fprintf(file_pointer, "ImageID,ClusterID\n");
     for (int i = 0; i < total_images; i++) {
         fprintf(file_pointer, "%d,%d\n", i, assignments[i]);
     }
+
     fclose(file_pointer);
     printf("Exported: %s\n", filename);
 }
@@ -210,7 +222,7 @@ void execute_cpu_baseline(const float* host_pixels, int* cpu_results,
 void setup_gpu_centroids(float* host_pixel_buffer) {
     size_t total_elements = MAX_CLUSTERS * IMAGE_DIMENSIONS;
     for (size_t i = 0; i < total_elements; i++) {
-        g_accumulated_centroids[i] = host_pixel_buffer[i];
+        g_centroids[i] = host_pixel_buffer[i];
     }
 }
 
@@ -253,10 +265,10 @@ void dispatch_gpu_step(float* device_pixels,
                         int* device_assignments, int batch_size, int clusters, 
                         int threads, int total_n, cudaStream_t stream, int offset) {
     int blocks = (batch_size + threads - 1) / threads;
-    size_t shared_size = (size_t)threads * IMAGE_DIMENSIONS * sizeof(float);
+    size_t shared_size = IMAGE_DIMENSIONS * sizeof(float);
 
     assignment_kernel<<<blocks, threads, shared_size, stream>>>(device_pixels, 
-        g_accumulated_centroids, device_assignments, batch_size, clusters, offset);
+        g_centroids, device_assignments, batch_size, clusters, offset);
     update_kernel<<<blocks, threads, 0, stream>>>(device_pixels, device_assignments, 
         batch_size, offset);
     finalize_centroids_kernel<<<1, clusters, 0, stream>>>(clusters);
@@ -280,25 +292,54 @@ float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n,
 
     checkCuda(cudaMalloc(&device_pixel_buffer, (size_t)chunk_size * IMAGE_DIMENSIONS * sizeof(float)));
     checkCuda(cudaMalloc(&device_assignment_buffer, (size_t)total_n * sizeof(int)));
+
+    checkCuda(cudaMemset(g_centroids, 0, sizeof(float) * MAX_CLUSTERS * IMAGE_DIMENSIONS));
+    checkCuda(cudaMemset(g_cluster_population, 0, sizeof(int) * MAX_CLUSTERS)); 
     
     checkCuda(cudaEventCreate(&start)); checkCuda(cudaEventCreate(&stop));
     checkCuda(cudaEventRecord(start));
 
-    // BOTTLE NECK ELIMINATED: Data transferred once before the iteration loop.
+    // Data transferred once before the iteration loop.
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+
     for (int offset = 0; offset < total_n; offset += chunk_size) {
-        int current_chunk = (offset + chunk_size > total_n) ? (total_n - offset) : chunk_size;
+
+        int current_chunk = (offset + chunk_size > total_n)
+                            ? (total_n - offset)
+                            : chunk_size;
+
         int s_idx = (offset / chunk_size) % NUM_STREAMS;
 
-        checkCuda(cudaMemcpyAsync(device_pixel_buffer, host_pixels + (size_t)offset * IMAGE_DIMENSIONS, 
-            (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float), 
-            cudaMemcpyHostToDevice, streams[s_idx]));
+        checkCuda(cudaMemcpyAsync(device_pixel_buffer,
+                 host_pixels + (size_t)offset * IMAGE_DIMENSIONS,
+                 (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float),
+                 cudaMemcpyHostToDevice,
+                 streams[s_idx]));
 
-        // Iterate kernels on resident data
-        for (int i = 0; i < MAX_ITERATIONS; i++) {
-            dispatch_gpu_step(device_pixel_buffer, device_assignment_buffer, 
-                current_chunk, k, threads, total_n, streams[s_idx], offset);
-        }
+        dispatch_gpu_step(device_pixel_buffer,
+                          device_assignment_buffer,
+                          current_chunk,
+                          k,
+                          threads,
+                          total_n,
+                          streams[s_idx],
+                          offset);
     }
+
+    // Finalize ONCE per full iteration
+    for (int i = 0; i < NUM_STREAMS; i++)
+        checkCuda(cudaStreamSynchronize(streams[i]));
+
+    checkCuda(cudaDeviceSynchronize());
+
+    int blocks_centroids = (k + threads - 1) / threads;
+    finalize_centroids_kernel<<<blocks_centroids, threads>>>(k);
+
+    int blocks_reset = (MAX_CLUSTERS * IMAGE_DIMENSIONS + threads - 1) / threads;
+    reset_centroids_kernel<<<blocks_reset, threads>>>();
+
+    checkCuda(cudaDeviceSynchronize());
+}
     
     checkCuda(cudaEventRecord(stop));
     checkCuda(cudaEventSynchronize(stop));
@@ -361,9 +402,16 @@ void run_performance_comparison(float* host_pixel_buffer,
                                 int current_batch_size,
                                 const char* execution_mode) {
     clock_t cpu_start_timer = clock();
-    execute_cpu_baseline(host_pixel_buffer, cpu_results, 
-                         host_pixel_buffer, total_image_count, 
-                         MAX_CLUSTERS);
+    float cpu_centroids[MAX_CLUSTERS * IMAGE_DIMENSIONS];
+
+    for (int i = 0; i < MAX_CLUSTERS; i++) {
+        memcpy(
+            &cpu_centroids[i * IMAGE_DIMENSIONS],
+            &host_pixel_buffer[i * IMAGE_DIMENSIONS],
+            IMAGE_DIMENSIONS * sizeof(float)
+        );
+    }
+    execute_cpu_baseline(host_pixel_buffer, cpu_results, cpu_centroids, total_image_count, MAX_CLUSTERS);
     double cpu_ms = (double)(clock() - cpu_start_timer) / 
                     CLOCKS_PER_SEC * MILLISECONDS_CONVERSION;
 
