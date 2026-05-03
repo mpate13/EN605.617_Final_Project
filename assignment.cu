@@ -529,7 +529,7 @@ void print_usage(char* prog_name) {
 void run_cpu_bench(float* x, float* c, int* labels, int n, int b, int mb, 
                    float* out_ms) {
     *out_ms = cpu_kmeans_timed(x, c, labels, n);
-    printf("CPU Time: %.2f ms\n", *out_ms);
+    // printf("CPU Time: %.2f ms\n", *out_ms);
 
     char file[128];
     snprintf(file, sizeof(file), "cpu_n%d_b%d_%s.csv", n, b, 
