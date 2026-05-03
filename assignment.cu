@@ -25,13 +25,13 @@ if ((x) != cudaSuccess) { \
 void cpu_kmeans(const float* x, float* c, int* labels, int n)
 {
     float tmp[K * DIM];
-    int cnt[K];
+    float cnt[K];
 
     for (int it = 0; it < ITER; it++) {
 
         for (int i = 0; i < n; i++) {
             float best = 1e30f;
-            int bestk = 0;
+            float bestk = 0;
 
             for (int k = 0; k < K; k++) {
                 float d = 0;
@@ -54,7 +54,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
         }
 
         for (int i = 0; i < n; i++) {
-            int k = labels[i];
+            float k = labels[i];
             cnt[k]++;
             for (int d_i = 0; d_i < DIM; d_i++) {
                 tmp[k * DIM + d_i] += x[i * DIM + d_i];
