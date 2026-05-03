@@ -8,6 +8,15 @@
 #define DIM 3072
 #define ITER 20
 
+// ---------------- ERROR CHECK ----------------
+
+#define CUDA_CHECK(x) \
+if ((x) != cudaSuccess) { \
+    printf("CUDA ERROR: %s (%s:%d)\n", \
+    cudaGetErrorString(x), __FILE__, __LINE__); \
+    exit(1); \
+}
+
 // ---------------- CPU BASELINE ----------------
 
 void cpu_kmeans(const float* x, float* c, int* labels, int n) {
@@ -17,7 +26,6 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n) {
 
     for (int it = 0; it < ITER; it++) {
 
-        // assign
         for (int i = 0; i < n; i++) {
             float best = 1e30f;
             int bestk = 0;
@@ -36,60 +44,45 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n) {
             labels[i] = bestk;
         }
 
-        // reset
         for (int k = 0; k < K; k++) {
             cnt[k] = 0;
             for (int d_i = 0; d_i < DIM; d_i++)
                 tmp[k * DIM + d_i] = 0;
         }
 
-        // update
         for (int i = 0; i < n; i++) {
             int k = labels[i];
             cnt[k]++;
-            for (int d_i = 0; d_i < DIM; d_i++) {
+            for (int d_i = 0; d_i < DIM; d_i++)
                 tmp[k * DIM + d_i] += x[i * DIM + d_i];
-            }
         }
 
         for (int k = 0; k < K; k++) {
             if (cnt[k] == 0) continue;
-            for (int d_i = 0; d_i < DIM; d_i++) {
+            for (int d_i = 0; d_i < DIM; d_i++)
                 c[k * DIM + d_i] = tmp[k * DIM + d_i] / cnt[k];
-            }
         }
     }
 }
 
-// ---------------- GPU TILED KERNEL ----------------
+// ---------------- GPU KERNEL ----------------
 
 __global__ void kmeans_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ c,
+    const float* x,
+    const float* c,
     int* labels,
     float* out_sum,
     int* out_cnt,
     int n)
 {
-    extern __shared__ float tile[];  // ONLY input tile
-
-    int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + tid;
-
-    float* xi = tile + tid * DIM;
-
-    // load input tile (OK for shared memory)
-    if (i < n) {
-        for (int d = 0; d < DIM; d++) {
-            xi[d] = x[i * DIM + d];
-        }
-    }
-
-    __syncthreads();
-
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    // keep centroid reads in GLOBAL (cached by L2!)
+    float xi[DIM]; // ⚠️ moved to register (SAFE fix)
+
+    for (int d = 0; d < DIM; d++)
+        xi[d] = x[i * DIM + d];
+
     float best = 1e30f;
     int bestk = 0;
 
@@ -110,7 +103,6 @@ __global__ void kmeans_kernel(
 
     labels[i] = bestk;
 
-    // SAFE global accumulation (no shared memory explosion)
     atomicAdd(&out_cnt[bestk], 1);
 
     for (int d_i = 0; d_i < DIM; d_i++) {
@@ -139,14 +131,14 @@ float gpu_kmeans(const float* x, float* c, int* labels,
     float *d_x, *d_c, *d_sum;
     int *d_labels, *d_cnt;
 
-    cudaMalloc(&d_x, n * DIM * sizeof(float));
-    cudaMalloc(&d_c, K * DIM * sizeof(float));
-    cudaMalloc(&d_labels, n * sizeof(int));
-    cudaMalloc(&d_sum, K * DIM * sizeof(float));
-    cudaMalloc(&d_cnt, K * sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_x, n * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_labels, n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));
 
-    cudaMemcpy(d_x, x, n * DIM * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_x, x, n * DIM * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
 
     int blocks = (n + block_size - 1) / block_size;
 
@@ -158,14 +150,20 @@ float gpu_kmeans(const float* x, float* c, int* labels,
 
     for (int it = 0; it < ITER; it++) {
 
-        cudaMemset(d_sum, 0, K * DIM * sizeof(float));
-        cudaMemset(d_cnt, 0, K * sizeof(int));
+        CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
         kmeans_kernel<<<blocks, block_size>>>(
             d_x, d_c, d_labels, d_sum, d_cnt, n
         );
 
+        CUDA_CHECK(cudaGetLastError());       // 🔥 catch kernel failure
+        CUDA_CHECK(cudaDeviceSynchronize());  // 🔥 ensure execution
+
         normalize<<<1, K>>>(d_c, d_sum, d_cnt);
+
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     cudaEventRecord(e);
@@ -174,8 +172,8 @@ float gpu_kmeans(const float* x, float* c, int* labels,
     float ms;
     cudaEventElapsedTime(&ms, s, e);
 
-    cudaMemcpy(labels, d_labels, n * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(c, d_c, K * DIM * sizeof(float), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(labels, d_labels, n * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c, d_c, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
 
     cudaFree(d_x);
     cudaFree(d_c);
@@ -195,8 +193,8 @@ void init(float* x, int n) {
 
 int main(int argc, char** argv) {
 
-    int n = atoi(argv[1]);          // total threads = data points
-    int block_size = atoi(argv[2]); // CUDA config
+    int n = atoi(argv[1]);
+    int block_size = atoi(argv[2]);
 
     float* x = (float*)malloc(n * DIM * sizeof(float));
     float* c1 = (float*)malloc(K * DIM * sizeof(float));
