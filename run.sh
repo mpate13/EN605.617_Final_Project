@@ -1,18 +1,25 @@
 #!/bin/bash
 
-DATA_FILE="data_batch_1.bin"
+# Configuration
+FULL_DATASET="cifar10_full.bin"
 TAR_FILE="cifar-10-binary.tar.gz"
 URL="https://www.cs.toronto.edu/~kriz/cifar-10-binary.tar.gz"
 
-if [ ! -f "$DATA_FILE" ]; then
-    echo "Dataset not found. Downloading CIFAR-10..."
-    # wget $URL -O $TAR_FILE
+# 1. Prepare Data
+if [ ! -f "$FULL_DATASET" ]; then
+    echo "Dataset not found. Downloading and merging CIFAR-10..."
+    
+    # Download and extract
+    wget -q $URL -O $TAR_FILE
     tar -xzf $TAR_FILE
-    # Move the specific batch file to the current directory
-    cp cifar-10-batches-bin/data_batch_1.bin .
-    # Cleanup extra files
-    # rm -rf cifar-10-batches-bin $TAR_FILE
-    echo "Dataset ready."
+    
+    # Concatenate all 5 batches into one contiguous file
+    # This allows you to handle N up to 50,000 safely
+    cat cifar-10-batches-bin/data_batch_*.bin > $FULL_DATASET
+    
+    # Cleanup
+    rm -rf cifar-10-batches-bin $TAR_FILE
+    echo "Dataset ready: $FULL_DATASET (50,000 images)"
 fi
 
 # Clean and Build

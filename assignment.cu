@@ -479,6 +479,47 @@ void init(float* x, int n) {
         x[i] = (float)rand() / RAND_MAX;
 }
 
+void load_cifar_dataset(const char* file_path, float* host_pixels, 
+                                                            int num_images) {
+    // Temporary buffer to hold the actual data (50k images max)
+    size_t base_size = DATASET_SIZE_LIMIT * DIM * sizeof(float);
+    float* base_buffer = (float*)malloc(base_size);
+
+    FILE* file_pointer = fopen(file_path, "rb");
+    if (!file_pointer) {
+        printf("Error: Could not open %s. Using noise.\n", file_path);
+        for(int i=0; i < num_images * DIM; i++) 
+            host_pixels[i] = (float)rand()/RAND_MAX;
+        free(base_buffer);
+        return;
+    }
+
+    unsigned char row_buffer[CIFAR_BINARY_ROW_SIZE];
+    int loaded_count = 0;
+    while (loaded_count < DATASET_SIZE_LIMIT && 
+           fread(row_buffer, 1, CIFAR_BINARY_ROW_SIZE, file_pointer) == 
+                                                        CIFAR_BINARY_ROW_SIZE) {
+        for (int d = 0; d < DIM; d++) {
+            base_buffer[loaded_count * DIM + d] = 
+                (float)row_buffer[d + FIRST_DATA_CHANNEL_OFFSET] / 
+                                                        NORMALIZE_PIXEL_VALUE;
+        }
+        loaded_count++;
+    }
+    fclose(file_pointer);
+    printf("Loaded %d real images from disk.\n", loaded_count);
+
+    for (int i = 0; i < num_images; i++) {
+        int source_idx = i % loaded_count;
+        memcpy(&host_pixels[i * DIM], &base_buffer[source_idx * DIM], 
+                                                            DIM * sizeof(float));
+    }
+
+    free(base_buffer);
+    printf("Host buffer filled with %d images (using cyclic data).\n", 
+                                                                    num_images);
+}
+
 void print_usage(char* prog_name) {
     printf("Usage: %s <n> <block_size> [--mini-batch]\n", prog_name);
 }
@@ -531,8 +572,9 @@ int main(int argc, char** argv) {
     int *cpu_labels = (int*)malloc(n * sizeof(int));
     int *gpu_labels = (int*)malloc(n * sizeof(int));
 
-    srand(0);
-    init(x, n);
+    // srand(0);
+    // init(x, n);
+    load_cifar_dataset("cifar10_full.bin", x, n);
     for (int i = 0; i < K * DIM; i++) c[i] = x[i];
 
     float cpu_ms, gpu_ms;
