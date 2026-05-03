@@ -26,6 +26,103 @@
     } \
 } while(0)
 
+/**
+ * CIFAR-10 K-MEANS CLUSTERING: GPU ACCELERATION, MEMORY HIERARCHY OPTIMIZATION,
+ * AND MINI-BATCH PERFORMANCE TRADEOFFS
+ * ----------------------------------------------------------------------------
+ *
+ * MOTIVATION:
+ * CIFAR-10 (3072-dimensional image vectors) makes classical K-Means extremely
+ * expensive due to high dimensionality and repeated distance computations.
+ * This project benchmarks CPU vs GPU implementations and explores how CUDA
+ * optimizations and algorithmic approximations (mini-batching) improve runtime
+ * while preserving clustering quality.
+ *
+ * The primary bottleneck is the O(N * K * DIM) distance computation combined
+ * with high memory bandwidth pressure when repeatedly accessing centroid data.
+ *
+ * ----------------------------------------------------------------------------
+ * CORE DESIGN GOALS:
+ * 1. Minimize global memory bandwidth pressure
+ * 2. Maximize data reuse via tiling and shared memory
+ * 3. Reduce synchronization overhead
+ * 4. Explore stochastic convergence via mini-batch K-Means
+ *
+ * ----------------------------------------------------------------------------
+ * GPU OPTIMIZATION STRATEGIES:
+ *
+ * (1) TILE-BASED CENTROID LOADING (TILE_K):
+ *     - Centroids are processed in small chunks (tiles) to improve cache reuse
+ *     - Avoids repeated global memory fetches of all K centroids per thread
+ *     - Trades recomputation for reduced memory bandwidth pressure
+ *
+ * (2) SHARED MEMORY ACCELERATION:
+ *     - Centroid tiles are staged in __shared__ memory
+ *     - Enables low-latency reuse during distance calculations
+ *     - Critical for high-dimensional (DIM=3072) vector operations
+ *
+ * (3) WARP AND THREAD PARALLELISM:
+ *     - Each thread processes one data point
+ *     - DIM loop is distributed across threads (strided access pattern)
+ *     - Atomic operations used for safe concurrent aggregation
+ *
+ * (4) MINI-BATCH K-MEANS:
+ *     - Processes random subsets of data instead of full dataset per iteration
+ *     - Reduces computational load from O(N) → O(batch_size)
+ *     - Introduces stochastic updates using learning rate smoothing
+ *     - Trades convergence stability for major runtime improvements
+ *
+ * (5) ATOMIC REDUCTION STRATEGY:
+ *     - cluster_sums and cluster_counts use atomicAdd operations
+ *     - Necessary due to many-thread write contention
+ *     - Chosen over block-level reductions for simplicity and scalability
+ *
+ * ----------------------------------------------------------------------------
+ * KEY BOTTLENECKS AND TRADEOFFS:
+ *
+ * - HIGH DIMENSIONALITY (DIM = 3072):
+ *   Dominates arithmetic workload; unrolling or vectorization is limited
+ *
+ * - GLOBAL MEMORY LATENCY:
+ *   Repeated centroid access is expensive → mitigated via shared memory tiling
+ *
+ * - ATOMIC CONTENTION:
+ *   cluster_sums updates can serialize under heavy load
+ *
+ * - SYNCHRONIZATION OVERHEAD:
+ *   __syncthreads() required between tile loads and computation phases
+ *
+ * - CONSTANTS USED (K, DIM, TILE_K, ITER):
+ *   These are compile-time constants to:
+ *   - Enable loop unrolling and compiler optimization
+ *   - Avoid dynamic indexing overhead in kernels
+ *   - Ensure shared memory allocation is static and efficient
+ *
+ * ----------------------------------------------------------------------------
+ * EXPECTED OUTPUT:
+ *
+ * 1. CONSOLE:
+ *    - CPU baseline runtime (full deterministic K-Means)
+ *    - GPU standard K-Means runtime
+ *    - GPU mini-batch runtime
+ *    - Speedup factor comparison
+ *
+ * 2. CSV OUTPUTS:
+ *    - cpu_n*_b*_*.csv  → CPU cluster assignments
+ *    - gpu_n*_b*_*.csv  → GPU cluster assignments
+ *
+ * ----------------------------------------------------------------------------
+ * SUMMARY:
+ * This implementation demonstrates how classical clustering algorithms can be
+ * significantly accelerated using CUDA through:
+ * - Memory hierarchy optimization (global → shared)
+ * - Data tiling strategies for large centroid sets
+ * - Parallel per-point assignment model
+ * - Stochastic mini-batch convergence acceleration
+ *
+ * The design highlights the tradeoff between deterministic convergence (CPU /
+ * full-batch GPU) and high-throughput approximate learning (mini-batch GPU).
+ */
 
 // ============================================================
 // CSV EXPORT
@@ -577,6 +674,31 @@ void print_report(int n, int block, int mb, float cpu, float gpu) {
     printf("==================================================\n\n");
 }
 
+void dump_features_for_pca(const char* filename,
+                           const float* x,
+                           const int* labels,
+                           int n) {
+    FILE* f = fopen(filename, "wb");
+    if (!f) {
+        printf("Failed to open PCA export file: %s\n", filename);
+        return;
+    }
+
+    // Write metadata
+    fwrite(&n, sizeof(int), 1, f);
+    fwrite(&DIM, sizeof(int), 1, f);
+
+    // Write labels
+    fwrite(labels, sizeof(int), n, f);
+
+    // Write feature vectors (n × DIM)
+    fwrite(x, sizeof(float), (size_t)n * DIM, f);
+
+    fclose(f);
+
+    printf("PCA export written to %s\n", filename);
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) { print_usage(argv[0]); return 1; }
 
@@ -601,6 +723,10 @@ int main(int argc, char** argv) {
     run_gpu_bench(x, c, gpu_labels, n, block, mb, &gpu_ms);
 
     print_report(n, block, mb, cpu_ms, gpu_ms);
+
+    // dump_features_for_pca("features.bin", x, gpu_labels, n);
+    dump_features_for_pca("cpu_features.bin", x, cpu_labels, n);
+    dump_features_for_pca("gpu_features.bin", x, gpu_labels, n);    
 
     free(x); free(c);
     free(cpu_labels); free(gpu_labels);

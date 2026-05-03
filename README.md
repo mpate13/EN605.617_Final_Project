@@ -1,18 +1,131 @@
 # GPU-Accelerated K-Means Clustering for CIFAR-10
-* Author: Molly Pate
-* EN.605.617
+*Author: Molly Pate*  
+*Course: EN.605.617*
 
-## Project Motivation
-This project focuses on the design and optimization of a GPU-accelerated implementation of the K-Means clustering algorithm using CUDA. As an unsupervised learning algorithm, K-Means is traditionally computationally expensive due to repeated distance calculations in high-dimensional space.
+---
 
-The core motivation is to leverage the massively parallel architecture of the GPU to reduce processing latency. By evaluating the trade-offs between Standard K-Means (global convergence) and Mini-Batch K-Means (stochastic efficiency), this project explores the limits of scalability and hardware utilization.
+## Project Overview
 
-## Architecture
-This design leverages some of the concepts to help with large data bottlenecks, as described over several modules (Note: This largely builds off of the memory management module 5).
-1. **Read-Only Cache:** Utilizes the `__restrict__` qualifier to bypass the 64KB hardware limits of constant memory, ensuring fast access to centroid data.
-2. **Shared Memory Tiling:** Implements L1-speed staging for 3072-dimension vectors. Blocks load subsets of data into shared memory to facilitate reuse and reduce expensive global memory transactions.
-3. **Unified Managed Memory:** Simplifies data coherence between the CPU and GPU for atomic updates and centroid recomputation.
-4. **Asynchronous Streaming:** Employs multiple CUDA streams to overlap data transfers with kernel execution, transitioning the program from being communication-bound to compute-bound.
+This project implements and benchmarks a GPU-accelerated version of the K-Means clustering algorithm using CUDA, targeting the CIFAR-10 dataset represented as high-dimensional feature vectors (3072 dimensions per image).
+
+K-Means is computationally expensive due to repeated distance calculations between each data point and all cluster centroids, resulting in an O(N × K × DIM) complexity per iteration. This becomes particularly costly for image-scale datasets.
+
+The primary goal of this project is to explore how GPU parallelism and memory hierarchy optimizations can significantly reduce runtime, and how approximate methods such as Mini-Batch K-Means trade convergence stability for performance.
+
+Both CPU and GPU implementations are included to provide a direct performance comparison.
+
+---
+
+## Key Contributions
+
+This implementation explores both **algorithmic and architectural optimizations**, including:
+
+- Full-batch vs Mini-Batch K-Means
+- CUDA kernel-level parallelization
+- Memory hierarchy optimization (global => shared memory)
+- Atomic-based parallel reductions
+- Data tiling for high-dimensional centroid computation
+- Streaming execution (where applicable in benchmarking framework)
+
+---
+
+## CUDA Architecture & Optimizations
+
+### 1. Shared Memory Tiling (Centroid Blocking)
+To reduce repeated global memory accesses, centroids are loaded in tiles (`TILE_K`) into **shared memory**. Each thread block processes a subset of centroids at a time, improving reuse and significantly reducing memory bandwidth pressure.
+
+This is especially important given:
+- High dimensionality (DIM = 3072)
+- Frequent centroid access per distance computation
+
+---
+
+### 2. High-Dimensional Distance Optimization
+Each thread computes the distance between one data point and all centroids. To handle the large feature space efficiently:
+
+- Distance computation is fully parallelized across threads
+- Strided loops distribute DIM computation
+- Memory access patterns are structured for coalescing where possible
+
+---
+
+### 3. Atomic Aggregation for Cluster Updates
+Cluster assignment updates require concurrent writes:
+
+- `atomicAdd` is used for safe accumulation of:
+  - cluster sums (`cluster_sums`)
+  - cluster counts (`cluster_counts`)
+
+While atomic operations introduce contention, they simplify correctness and maintain scalability across large datasets.
+
+---
+
+### 4. Mini-Batch K-Means (Algorithmic Optimization)
+#### Why try Mini-Batching: 
+**My Theory:** Mini-Batch K-Means is included in this project as a performance-oriented alternative to full-batch K-Means, designed to improve scalability on large, high-dimensional datasets like CIFAR-10. Instead of computing centroid updates using the entire dataset in each iteration, the algorithm processes a randomly sampled subset of data points, significantly reducing per-iteration computational cost from O(N × K × DIM) to O(batch_size × K × DIM). In this implementation, a random offset is used each iteration to select a contiguous batch, and centroid updates are performed using a learning-rate-based rule that incrementally adjusts centroids toward the batch mean. This stochastic update strategy reduces memory bandwidth pressure, lowers atomic contention, and improves overall GPU throughput. While this introduces noisier updates and potentially less stable convergence compared to full-batch K-Means, the tradeoff is acceptable for CIFAR-10 clustering, where approximate structure is sufficient for downstream analysis such as visualization or dimensionality reduction. 
+
+In the mini-batch version:
+
+- Only a random subset of the dataset is processed per iteration
+- Centroids are updated using a learning rate:
+  
+  `c = c + alpha(batch_mean - c)`
+
+This reduces computation from full dataset passes to partial updates, improving runtime at the cost of noisier convergence behavior.
+
+---
+
+### 5. Kernels & Parallel Execution 
+The GPU pipeline separates responsibilities:
+
+- `kmeans_minibatch_kernel`: assignment + accumulation
+- `update_centroids_full`: centroid recomputation (standard GPU mode)
+- `update_centroids_minibatch`: incremental centroid updates
+
+This separation allows tuning between:
+- deterministic convergence (full batch)
+- stochastic convergence (mini-batch)
+
+---
+
+## Key Bottlenecks & Design Tradeoffs
+
+### 1. High Dimensionality (DIM = 3072)
+- Dominates runtime due to repeated floating-point operations
+- Limits effectiveness of some warp-level optimizations
+- Justifies use of tiling and shared memory
+
+---
+
+### 2. Global Memory Bandwidth
+- Centroid reads are frequent and expensive
+- Mitigated using shared memory staging (TILE_K strategy)
+
+---
+
+### 3. Atomic Contention
+- Cluster updates create serialization under high load
+- Tradeoff between correctness and performance
+
+---
+
+### 4. Synchronization Overhead
+- `__syncthreads()` required between tile loads and computation phases
+- Necessary for correctness but introduces latency
+
+---
+
+### 5. Constant vs Compile-Time Parameters
+Key parameters are defined as constants:
+
+- `K`, `DIM`, `TILE_K`, `ITER`
+
+This enables:
+- Compiler optimizations (loop unrolling, constant propagation)
+- Static shared memory allocation
+- Reduced runtime overhead from dynamic indexing
+
+---
 
 ## How to Run
 For the most basic setup, to run a series of tests, simply at the root of the directly run start a series of tests across several numbers of images, and implementation techniques. 
