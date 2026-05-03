@@ -281,7 +281,7 @@ void dispatch_gpu_step(float* device_pixels,
  * to maximize throughput and eliminate PCIe bottlenecks.
  */
 float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n, 
-                        int k, int batch, int threads) {
+                        int k, int batch, int threads, int used_pinned) {
     float *device_pixel_buffer, elapsed_ms;
     int *device_assignment_buffer;
     cudaEvent_t start, stop;
@@ -381,7 +381,8 @@ void run_performance_comparison(float* host_pixel_buffer,
                                 int total_image_count,
                                 int threads_per_block,
                                 int current_batch_size,
-                                const char* execution_mode) {
+                                const char* execution_mode, 
+                                int used_pinned) {
     clock_t cpu_start_timer = clock();
     execute_cpu_baseline(host_pixel_buffer, cpu_results, 
                          host_pixel_buffer, total_image_count, 
@@ -394,7 +395,7 @@ void run_performance_comparison(float* host_pixel_buffer,
                                      total_image_count, 
                                      MAX_CLUSTERS, 
                                      current_batch_size, 
-                                     threads_per_block);
+                                     threads_per_block, used_pinned);
 
     printf("Execution Mode: %s\n", execution_mode);
     printf("CPU Execution Time: %.2f ms\n", cpu_ms);
@@ -513,7 +514,7 @@ int main(int argc, char** argv) {
     run_performance_comparison(host_pixel_buffer, cpu_results, 
                                gpu_results, total_image_count, 
                                threads_per_block, current_batch_size, 
-                               execution_mode);
+                               execution_mode, used_pinned);
 
     export_benchmark_results(cpu_results, gpu_results, 
                              total_image_count, threads_per_block, 
