@@ -166,19 +166,26 @@ __global__ void kmeans_assign_reduce(
 // GPU KERNEL: MINI-BATCH
 // ============================================================
 
-__global__ void kmeans_minibatch_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ c,
-    int* labels,
-    float* sum,
-    int* cnt,
-    int n)
-{
-    // Reuse the same optimized logic as standard kernel
-    kmeans_assign_reduce<<<gridDim, blockDim>>>(x, c, labels, sum, cnt, n);
-}
+// __global__ void kmeans_minibatch_kernel(
+//     const float* __restrict__ x,
+//     const float* __restrict__ c,
+//     int* labels,
+//     float* sum,
+//     int* cnt,
+//     int n)
+// {
+//     // Reuse the same optimized logic as standard kernel
+//     kmeans_assign_reduce<<<gridDim, blockDim>>>(x, c, labels, sum, cnt, n);
+// }
 
-
+kmeans_assign_reduce<<<blocks, block_size>>>(
+    d_x + (size_t)offset * DIM,
+    d_c,
+    d_labels + offset,
+    d_sum,
+    d_cnt,
+    batch_size
+);
 // ============================================================
 // DRIVERS
 // ============================================================
