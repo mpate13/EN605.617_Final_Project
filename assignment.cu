@@ -372,7 +372,7 @@ int main(int argc, char** argv)
     printf("CPU Time: %.2f ms\n", cpu_ms);
 
     char cpu_file[128];
-    sprintf(cpu_file, "cpu_n%d_b%d_%s.csv", n, block, mb ? "minibatch" : "standard");
+    // sprintf(cpu_file, "cpu_n%d_b%d_%s.csv", n, block, mb ? "minibatch" : "standard");
     export_to_csv(cpu_file, cpu_labels, n);
 
     // reset centroids
@@ -385,11 +385,14 @@ int main(int argc, char** argv)
         :
         gpu_kmeans_standard(x, c, gpu_labels, n, block);
 
+        float speedup = cpu_ms / gpu_ms;
+
     printf("Mode: %s\n", mb ? "MINI-BATCH" : "STANDARD");
     printf("GPU Time: %.2f ms\n", gpu_ms);
+    printf("Speedup Factor: %.2fx\n", speedup);
 
     char gpu_file[128];
-    sprintf(gpu_file, "gpu_n%d_b%d_%s.csv", n, block, mb ? "minibatch" : "standard");
+    // sprintf(gpu_file, "gpu_n%d_b%d_%s.csv", n, block, mb ? "minibatch" : "standard");
     export_to_csv(gpu_file, gpu_labels, n);
 
     free(x);
