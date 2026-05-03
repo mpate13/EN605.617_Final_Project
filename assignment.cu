@@ -329,6 +329,19 @@ int main(int argc, char** argv)
     for (int i = 0; i < K * DIM; i++)
         c[i] = x[i];
 
+    // ========================================================
+    // ALWAYS RUN CPU BASELINE
+    // ========================================================
+    float cpu_ms = cpu_kmeans_timed(x, c, labels, n);
+    printf("CPU Time: %.2f ms\n", cpu_ms);
+
+    // reset centroids for fair GPU comparison
+    for (int i = 0; i < K * DIM; i++)
+        c[i] = x[i];
+
+    // ========================================================
+    // RUN GPU
+    // ========================================================
     float gpu_ms = mb ?
         gpu_kmeans_minibatch(x, c, labels, n, block)
         :
