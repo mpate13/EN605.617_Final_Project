@@ -13,12 +13,14 @@
 
 #define WARP_SIZE 32
 
-#define CUDA_CHECK(x) \
-if ((x) != cudaSuccess) { \
-    printf("CUDA ERROR: %s (%s:%d)\n", \
-    cudaGetErrorString(x), __FILE__, __LINE__); \
-    exit(1); \
-}
+#define CUDA_CHECK(x) do { \
+    cudaError_t err = (x); \
+    if (err != cudaSuccess) { \
+        printf("CUDA ERROR: %s (%s:%d)\n", \
+            cudaGetErrorString(err), __FILE__, __LINE__); \
+        exit(1); \
+    } \
+} while(0)
 
 // ---------------- CPU BASELINE ----------------
 
