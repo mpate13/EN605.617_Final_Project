@@ -11,7 +11,7 @@ if [ ! -f "$DATA_FILE" ]; then
     # Move the specific batch file to the current directory
     cp cifar-10-batches-bin/data_batch_1.bin .
     # Cleanup extra files
-    rm -rf cifar-10-batches-bin $TAR_FILE
+    # rm -rf cifar-10-batches-bin $TAR_FILE
     echo "Dataset ready."
 fi
 
