@@ -23,7 +23,7 @@ if ((x) != cudaSuccess) { \
 void cpu_kmeans(const float* x, float* c, int* labels, int n)
 {
     float tmp[K * DIM];
-    int cnt[K];   // ✅ must be int
+    int cnt[K];
 
     for (int it = 0; it < ITER; it++) {
 
@@ -119,22 +119,22 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     float *d_x[NUM_STREAMS];
     float *d_sum;
-    int *d_cnt;   // ✅ FIX: int*, not float*
+    int *d_cnt;                 // ✅ MUST be int*
     float *d_c, *d_labels;
 
     int chunk = CHUNK_SIZE;
 
     for (int s = 0; s < NUM_STREAMS; s++) {
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
-        CUDA_CHECK(cudaMalloc(&d_x[s], chunk * DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_x[s], (size_t)chunk * DIM * sizeof(float)));
     }
 
-    CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));   // ✅ correct type
-    CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_sum, (size_t)K * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_cnt, (size_t)K * sizeof(int)));   // ✅ correct
+    CUDA_CHECK(cudaMalloc(&d_c, (size_t)K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_labels, (size_t)n * sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_c, c, (size_t)K * DIM * sizeof(float), cudaMemcpyHostToDevice));
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
@@ -143,8 +143,8 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     for (int it = 0; it < ITER; it++) {
 
-        CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_sum, 0, (size_t)K * DIM * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_cnt, 0, (size_t)K * sizeof(int)));
 
         for (int offset = 0; offset < n; offset += chunk)
         {
@@ -178,7 +178,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
         for (int s = 0; s < NUM_STREAMS; s++)
             CUDA_CHECK(cudaStreamSynchronize(streams[s]));
 
-        CUDA_CHECK(cudaMemcpy(c, d_c, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(c, d_c, (size_t)K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
     }
 
     CUDA_CHECK(cudaEventRecord(stop));
