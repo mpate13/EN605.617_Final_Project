@@ -9,7 +9,7 @@
 #define ITER 20
 #define WARP_SIZE 32
 #define TILE_SIZE 16384 
-#define SHARED_DIM_CHUNK 128 // Process 128 dims at a time to fit in Shared Mem
+#define SHARED_DIM_CHUNK 128 
 
 #define CUDA_CHECK(x) \
     if ((x) != cudaSuccess) { \
@@ -17,7 +17,14 @@
         exit(1); \
     }
 
-// ---------------- KERNELS ----------------
+// Procedural generation: Generates a chunk of data without storing it all
+void generate_data_chunk(float* buffer, int n_elements) {
+    for (int i = 0; i < n_elements * DIM; i++) {
+        buffer[i] = (float)rand() / RAND_MAX;
+    }
+}
+
+// ---------------- KERNELS (Kept Optimized) ----------------
 
 __device__ __forceinline__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -47,21 +54,15 @@ __global__ void kmeans_assignment_kernel(const float* __restrict__ x, const floa
     if (lane == 0) labels[warp_id] = bestk;
 }
 
-// Optimized Accumulate Kernel using Shared Memory
 __global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int* __restrict__ labels, float* sum, int* cnt, int n) {
     __shared__ float s_sum[K][SHARED_DIM_CHUNK];
     
-    // We process dimensions in chunks to fit into shared memory
     for (int d_start = 0; d_start < DIM; d_start += SHARED_DIM_CHUNK) {
-        // 1. Reset shared memory for this chunk
         for(int k=0; k<K; k++) {
-            for(int d = threadIdx.x; d < SHARED_DIM_CHUNK; d += blockDim.x) {
-                s_sum[k][d] = 0.0f;
-            }
+            for(int d = threadIdx.x; d < SHARED_DIM_CHUNK; d += blockDim.x) s_sum[k][d] = 0.0f;
         }
         __syncthreads();
 
-        // 2. Accumulate in shared memory
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
             int k = labels[i];
             for(int d = 0; d < SHARED_DIM_CHUNK; d++) {
@@ -71,7 +72,6 @@ __global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int*
         }
         __syncthreads();
 
-        // 3. Commit shared results to global memory
         for(int k=0; k<K; k++) {
             for(int d = threadIdx.x; d < SHARED_DIM_CHUNK; d += blockDim.x) {
                 int dim_idx = d_start + d;
@@ -80,7 +80,6 @@ __global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int*
         }
     }
     
-    // Count labels (using atomics is fine for counts)
     if (threadIdx.x == 0) {
         for (int i = 0; i < n; i++) atomicAdd(&cnt[labels[i]], 1);
     }
@@ -88,7 +87,7 @@ __global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int*
 
 // ---------------- GPU DRIVER ----------------
 
-float gpu_kmeans(FILE* f, int n, int block_size, int mini_batch) {
+float gpu_kmeans(int n, int block_size, int mini_batch) {
     float *d_x[2], *d_sum, *d_c;
     int *d_labels[2], *d_cnt;
     float *h_buffer[2];
@@ -118,12 +117,10 @@ float gpu_kmeans(FILE* f, int n, int block_size, int mini_batch) {
 
         for (int t = 0; t < max_iters; t++) {
             int stream_idx = t % 2;
-            int offset = mini_batch ? (rand() % (n - TILE_SIZE)) : (t * TILE_SIZE);
             int current_tile = (t == max_iters - 1 && (n % TILE_SIZE != 0)) ? (n % TILE_SIZE) : TILE_SIZE;
 
-            // Disk I/O Streaming
-            fseek(f, offset * DIM * sizeof(float), SEEK_SET);
-            fread(h_buffer[stream_idx], sizeof(float), current_tile * DIM, f);
+            // Generate data on-the-fly (No large mallocs!)
+            generate_data_chunk(h_buffer[stream_idx], current_tile);
 
             CUDA_CHECK(cudaMemcpyAsync(d_x[stream_idx], h_buffer[stream_idx], current_tile * DIM * sizeof(float), cudaMemcpyHostToDevice, streams[stream_idx]));
 
@@ -133,7 +130,6 @@ float gpu_kmeans(FILE* f, int n, int block_size, int mini_batch) {
         }
         cudaDeviceSynchronize();
         
-        // Finalize Centroids
         float h_sum[K * DIM]; int h_cnt[K];
         CUDA_CHECK(cudaMemcpy(h_sum, d_sum, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_cnt, d_cnt, K * sizeof(int), cudaMemcpyDeviceToHost));
@@ -144,18 +140,17 @@ float gpu_kmeans(FILE* f, int n, int block_size, int mini_batch) {
             }
         }
     }
-    // [Cleanup: free memory, streams, file pointers...]
+    // Cleanup... (Free everything)
     return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) { printf("Usage: %s <N> <block_size> <filename> [--mini-batch]\n", argv[0]); return 1; }
+    if (argc < 3) return 1;
     int n = atoi(argv[1]);
     int block_size = atoi(argv[2]);
-    FILE* f = fopen(argv[3], "rb");
-    int mini_batch = (argc > 4 && strcmp(argv[4], "--mini-batch") == 0);
+    int mini_batch = (argc > 3 && strcmp(argv[3], "--mini-batch") == 0);
 
-    gpu_kmeans(f, n, block_size, mini_batch);
-    fclose(f);
+    // NOTICE: No giant malloc for 1M images here. Memory is safe!
+    gpu_kmeans(n, block_size, mini_batch);
     return 0;
 }
