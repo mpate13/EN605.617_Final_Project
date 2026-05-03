@@ -63,7 +63,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n) {
 
 // ---------------- GPU TILED KERNEL ----------------
 
-__global__ void kmeans_kernel_fixed(
+__global__ void kmeans_kernel(
     const float* __restrict__ x,
     const float* __restrict__ c,
     int* labels,
