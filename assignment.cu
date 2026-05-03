@@ -422,7 +422,7 @@ void allocate_host_resources(int total_image_count,
                              float** pixels, 
                              int** gpu_res, 
                              int** cpu_res,
-                             int* use_pinned) {
+                             int* used_pinned) {
     size_t pixel_size = (size_t)total_image_count * IMAGE_DIMENSIONS * sizeof(float);
     size_t result_size = (size_t)total_image_count * sizeof(int);
     *used_pinned = 1;
