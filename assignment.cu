@@ -425,7 +425,13 @@ void allocate_host_resources(int total_image_count,
     size_t pixel_size = (size_t)total_image_count * IMAGE_DIMENSIONS * sizeof(float);
     size_t result_size = (size_t)total_image_count * sizeof(int);
 
-    cudaHostAlloc(pixels, pixel_size, cudaHostAllocDefault);
+    cudaError_t err = cudaHostAlloc(pixels, pixel_size, cudaHostAllocDefault);
+
+    if (err != cudaSuccess) {
+        printf("Warning: cudaHostAlloc failed, falling back to malloc.\n");
+        *pixels = (float*)malloc(pixel_size);
+    }
+
     *gpu_res = (int*)malloc(result_size);
     *cpu_res = (int*)malloc(result_size);
 
@@ -451,7 +457,15 @@ void initialize_dataset(float* host_pixel_buffer, int total_image_count) {
  * Ensures all heap memory is properly released.
  */
 void cleanup_host_resources(float* pixels, int* gpu_res, int* cpu_res) {
-    if (pixels) cudaFreeHost(pixels);
+    if (pixels) {
+        cudaPointerAttributes attr;
+        if (cudaPointerGetAttributes(&attr, pixels) == cudaSuccess &&
+            attr.type == cudaMemoryTypeHost) {
+            cudaFreeHost(pixels);
+        } else {
+            free(pixels);
+        }
+    }
     if (gpu_res) free(gpu_res);
     if (cpu_res) free(cpu_res);
 }
