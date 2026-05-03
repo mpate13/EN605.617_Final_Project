@@ -10,7 +10,10 @@
 
 #define NUM_STREAMS 4
 #define CHUNK_SIZE 50000
+
 #define WARP_SIZE 32
+#define TILE_K 4
+#define TILE_D 32
 
 #define CUDA_CHECK(x) do { \
     cudaError_t err = (x); \
@@ -57,23 +60,21 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
         for (int i = 0; i < n; i++) {
             int k = labels[i];
             cnt[k]++;
-            for (int d_i = 0; d_i < DIM; d_i++) {
+            for (int d_i = 0; d_i < DIM; d_i++)
                 tmp[k * DIM + d_i] += x[i * DIM + d_i];
-            }
         }
 
         for (int k = 0; k < K; k++) {
             if (cnt[k] == 0) continue;
-            for (int d_i = 0; d_i < DIM; d_i++) {
+            for (int d_i = 0; d_i < DIM; d_i++)
                 c[k * DIM + d_i] = tmp[k * DIM + d_i] / cnt[k];
-            }
         }
     }
 }
 
-// ---------------- WARP AGGREGATED KERNEL ----------------
+// ---------------- RESEARCH-GRADE KERNEL ----------------
 
-__global__ void kmeans_kernel_warp(
+__global__ void kmeans_kernel_research(
     const float* __restrict__ x,
     const float* __restrict__ c,
     int* labels,
@@ -81,77 +82,74 @@ __global__ void kmeans_kernel_warp(
     int* out_cnt,
     int n)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane = threadIdx.x & 31;
 
-    const float* xi = &x[i * DIM];
+    if (warp_id >= n) return;
 
-    float best = 1e30f;
-    int bestk = 0;
+    const float* xi = x + warp_id * DIM;
 
-    // ---------------- ASSIGN ----------------
-    for (int k = 0; k < K; k++) {
-        float d = 0;
-        const float* ck = &c[k * DIM];
+    float best_dist = 1e30f;
+    int best_k = 0;
 
-        #pragma unroll 4
-        for (int d_i = 0; d_i < DIM; d_i++) {
-            float diff = xi[d_i] - ck[d_i];
-            d += diff * diff;
+    __shared__ float c_tile[TILE_K][DIM];
+
+    for (int k0 = 0; k0 < K; k0 += TILE_K)
+    {
+        // load centroid tile
+        for (int i = threadIdx.x; i < TILE_K * DIM; i += blockDim.x)
+        {
+            int ck = i / DIM;
+            int cd = i % DIM;
+
+            if (k0 + ck < K)
+                c_tile[ck][cd] = c[(k0 + ck) * DIM + cd];
         }
 
-        if (d < best) {
-            best = d;
-            bestk = k;
-        }
-    }
+        __syncthreads();
 
-    labels[i] = bestk;
+        for (int ck = 0; ck < TILE_K && (k0 + ck) < K; ck++)
+        {
+            float dist = 0.0f;
 
-    // ---------------- WARP AGGREGATION ----------------
-    int lane = threadIdx.x % WARP_SIZE;
-    int warp = threadIdx.x / WARP_SIZE;
+            for (int d = lane; d < DIM; d += WARP_SIZE * TILE_D)
+            {
+                float acc = 0.0f;
 
-    __shared__ float warp_sum[K][32]; // max 32 warps per block
-    __shared__ int warp_cnt[K][32];
+                #pragma unroll
+                for (int t = 0; t < TILE_D && (d + t) < DIM; t++)
+                {
+                    float diff = xi[d + t] - c_tile[ck][d + t];
+                    acc += diff * diff;
+                }
 
-    if (lane == 0) {
-        for (int k = 0; k < K; k++) {
-            warp_cnt[k][warp] = 0;
-            for (int d = 0; d < DIM; d++) {
-                warp_sum[k][warp] = 0.0f;
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    acc += __shfl_down_sync(0xffffffff, acc, offset);
+
+                if (lane == 0)
+                    dist += acc;
+            }
+
+            if (dist < best_dist)
+            {
+                best_dist = dist;
+                best_k = k0 + ck;
             }
         }
+
+        __syncthreads();
     }
 
-    __syncwarp();
+    if (lane == 0)
+        labels[warp_id] = best_k;
 
-    atomicAdd(&warp_cnt[bestk][warp], 1);
-    for (int d = 0; d < DIM; d++) {
-        atomicAdd(&warp_sum[bestk][warp], xi[d]);
-    }
+    atomicAdd(&out_cnt[best_k], 1);
 
-    __syncthreads();
-
-    if (lane == 0) {
-        for (int k = 0; k < K; k++) {
-            atomicAdd(&out_cnt[k], warp_cnt[k][warp]);
-        }
-    }
-
-    __syncthreads();
-
-    if (lane == 0) {
-        for (int k = 0; k < K; k++) {
-            atomicAdd(&out_cnt[k], warp_cnt[k][warp]);
-            for (int d = 0; d < DIM; d++) {
-                atomicAdd(&out_sum[k * DIM + d], warp_sum[k][warp]);
-            }
-        }
-    }
+    for (int d = lane; d < DIM; d += WARP_SIZE)
+        atomicAdd(&out_sum[best_k * DIM + d], xi[d]);
 }
 
-// ---------------- DRIVER ----------------
+// ---------------- STREAMED DRIVER ----------------
 
 float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int block_size)
 {
@@ -187,12 +185,9 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
-        for (int offset = 0; offset < n; offset += chunk) {
-
-            int cur = chunk;
-            if (offset + cur > n) cur = n - offset;
-            if (cur <= 0) continue;
-
+        for (int offset = 0; offset < n; offset += chunk)
+        {
+            int cur = (offset + chunk > n) ? (n - offset) : chunk;
             int s = (offset / chunk) % NUM_STREAMS;
 
             CUDA_CHECK(cudaMemcpyAsync(
@@ -205,7 +200,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
             int blocks = (cur + block_size - 1) / block_size;
 
-            kmeans_kernel_warp<<<blocks, block_size, 0, streams[s]>>>(
+            kmeans_kernel_research<<<blocks, block_size, 0, streams[s]>>>(
                 d_x[s],
                 d_c,
                 d_labels + offset,
@@ -223,11 +218,11 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
         CUDA_CHECK(cudaMemcpy(c, d_c, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
     }
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float ms;
-    cudaEventElapsedTime(&ms, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 
     CUDA_CHECK(cudaMemcpy(labels, d_labels, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost));
 
@@ -244,13 +239,15 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
     return ms;
 }
 
-// ---------------- INIT + MAIN ----------------
+// ---------------- INIT ----------------
 
 void init(float* x, int n)
 {
     for (int i = 0; i < n * DIM; i++)
         x[i] = (float)rand() / RAND_MAX;
 }
+
+// ---------------- MAIN ----------------
 
 int main(int argc, char** argv)
 {
@@ -272,7 +269,7 @@ int main(int argc, char** argv)
     }
 
     clock_t t1 = clock();
-    // cpu_kmeans(x, c1, l1, n);
+    cpu_kmeans(x, c1, l1, n);
     float cpu_ms = (float)(clock() - t1) / CLOCKS_PER_SEC * 1000;
 
     float gpu_ms = gpu_kmeans_streamed(x, c2, l2, n, block_size);
