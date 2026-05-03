@@ -69,39 +69,17 @@ __global__ void accumulate_kernel(
     int n,
     int k)
 {
-    __shared__ float local_sum[MAX_CLUSTERS * IMAGE_DIMENSIONS];
-    __shared__ int local_count[MAX_CLUSTERS];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
 
-    int tid = threadIdx.x;
+    int c = assignments[i];
 
-    if (tid < k) {
-        local_count[tid] = 0;
-        for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
-            local_sum[tid * IMAGE_DIMENSIONS + d] = 0.0f;
-        }
-    }
-    __syncthreads();
+    atomicAdd(&counts[c], 1);
 
-    int i = blockIdx.x * blockDim.x + tid;
-    if (i < n) {
-        int c = assignments[i];
-        atomicAdd(&local_count[c], 1);
+    const float* img = &images[i * IMAGE_DIMENSIONS];
 
-        for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
-            atomicAdd(&local_sum[c * IMAGE_DIMENSIONS + d],
-                      images[i * IMAGE_DIMENSIONS + d]);
-        }
-    }
-
-    __syncthreads();
-
-    if (tid < k) {
-        atomicAdd(&counts[tid], local_count[tid]);
-
-        for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
-            atomicAdd(&centroid_sums[tid * IMAGE_DIMENSIONS + d],
-                      local_sum[tid * IMAGE_DIMENSIONS + d]);
-        }
+    for (int d = 0; d < IMAGE_DIMENSIONS; d++) {
+        atomicAdd(&centroid_sums[c * IMAGE_DIMENSIONS + d], img[d]);
     }
 }
 
