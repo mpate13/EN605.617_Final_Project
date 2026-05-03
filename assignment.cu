@@ -124,17 +124,17 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 {
     cudaStream_t streams[NUM_STREAMS];
 
-    for (int i = 0; i < NUM_STREAMS; i++)
-        CUDA_CHECK(cudaStreamCreate(&streams[i]));
-
-    const int chunk = CHUNK_SIZE;
-
-    // 🔥 FIX: allocate ONCE
-    float *d_x;
+    float *d_x[NUM_STREAMS];   // 🔥 FIX: per-stream buffers
     float *d_c, *d_sum;
     int *d_cnt, *d_labels;
 
-    CUDA_CHECK(cudaMalloc(&d_x, chunk * DIM * sizeof(float)));
+    const int chunk = CHUNK_SIZE;
+
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        CUDA_CHECK(cudaStreamCreate(&streams[i]));
+
+        CUDA_CHECK(cudaMalloc(&d_x[i], chunk * DIM * sizeof(float)));
+    }
 
     CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
@@ -161,10 +161,8 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
             int cur = (offset + chunk > n) ? (n - offset) : chunk;
             int s = (offset / chunk) % NUM_STREAMS;
 
-            // 🔥 FIX: reuse same buffer, no cudaMalloc here
-
             CUDA_CHECK(cudaMemcpyAsync(
-                d_x,
+                d_x[s],
                 x + (size_t)offset * DIM,
                 (size_t)cur * DIM * sizeof(float),
                 cudaMemcpyHostToDevice,
@@ -174,7 +172,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
             int blocks = (cur + block_size - 1) / block_size;
 
             assign_kernel<<<blocks, block_size, 0, streams[s]>>>(
-                d_x,
+                d_x[s],                 // 🔥 FIX: stream-specific buffer
                 d_c,
                 d_labels + offset,
                 d_sum,
@@ -205,14 +203,15 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
         n * sizeof(int),
         cudaMemcpyDeviceToHost));
 
-    cudaFree(d_x);
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        cudaFree(d_x[i]);
+        cudaStreamDestroy(streams[i]);
+    }
+
     cudaFree(d_c);
     cudaFree(d_sum);
     cudaFree(d_cnt);
     cudaFree(d_labels);
-
-    for (int i = 0; i < NUM_STREAMS; i++)
-        cudaStreamDestroy(streams[i]);
 
     return ms;
 }
