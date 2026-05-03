@@ -272,7 +272,7 @@ int main(int argc, char** argv)
     }
 
     clock_t t1 = clock();
-    cpu_kmeans(x, c1, l1, n);
+    // cpu_kmeans(x, c1, l1, n);
     float cpu_ms = (float)(clock() - t1) / CLOCKS_PER_SEC * 1000;
 
     float gpu_ms = gpu_kmeans_streamed(x, c2, l2, n, block_size);
