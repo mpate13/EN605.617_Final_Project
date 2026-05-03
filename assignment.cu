@@ -277,6 +277,21 @@ void upload_kmeans_data(const KMeansDeviceBuffers& buffers,
                             K * DIM * sizeof(float), cudaMemcpyHostToDevice));
 }
 
+__global__ void update_centroids_full(
+    float* centroids,
+    const float* sums,
+    const int* counts)
+{
+    int k = blockIdx.x;
+
+    if (k >= K || counts[k] == 0) return;
+
+    for (int d = threadIdx.x; d < DIM; d += blockDim.x) {
+        centroids[k * DIM + d] =
+            sums[k * DIM + d] / counts[k];
+    }
+}
+
 // Execution Logic
 void run_kmeans_loop(const KMeansDeviceBuffers& buffers, int n, int block_size){
     int blocks = (n + block_size - 1) / block_size;
@@ -289,8 +304,8 @@ void run_kmeans_loop(const KMeansDeviceBuffers& buffers, int n, int block_size){
             buffers.d_c, buffers.d_labels, buffers.d_sum, buffers.d_cnt, n);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        update_centroids_minibatch<<<K, block_size>>>(buffers.d_c, 
-                                    buffers.d_sum, buffers.d_cnt, 1.0f);
+        update_centroids_full<<<K, block_size>>>(buffers.d_c, 
+                                                buffers.d_sum, buffers.d_cnt);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
