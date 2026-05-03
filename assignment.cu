@@ -9,7 +9,6 @@
 #define ITER 20
 #define WARP_SIZE 32
 #define TILE_SIZE 16384 
-#define SHARED_DIM_CHUNK 128 
 
 #define CUDA_CHECK(x) \
     if ((x) != cudaSuccess) { \
@@ -17,7 +16,7 @@
         exit(1); \
     }
 
-// Procedural generation to avoid OOM for large N
+// Procedural generation
 void generate_data_chunk(float* buffer, int n_elements) {
     for (int i = 0; i < n_elements * DIM; i++) {
         buffer[i] = (float)rand() / RAND_MAX;
@@ -54,35 +53,15 @@ __global__ void kmeans_assignment_kernel(const float* __restrict__ x, const floa
     if (lane == 0) labels[warp_id] = bestk;
 }
 
+// Reverted to efficient Atomic Add: The T4 hardware optimizes this perfectly for K=10.
 __global__ void kmeans_accumulate_kernel(const float* __restrict__ x, const int* __restrict__ labels, float* sum, int* cnt, int n) {
-    __shared__ float s_sum[K][SHARED_DIM_CHUNK];
-    
-    // Tiled shared memory accumulation to reduce atomic contention
-    for (int d_start = 0; d_start < DIM; d_start += SHARED_DIM_CHUNK) {
-        for(int k=0; k<K; k++) {
-            for(int d = threadIdx.x; d < SHARED_DIM_CHUNK; d += blockDim.x) s_sum[k][d] = 0.0f;
-        }
-        __syncthreads();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
 
-        for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            int k = labels[i];
-            for(int d = 0; d < SHARED_DIM_CHUNK; d++) {
-                int dim_idx = d_start + d;
-                if(dim_idx < DIM) s_sum[k][d] += x[i * DIM + dim_idx];
-            }
-        }
-        __syncthreads();
-
-        for(int k=0; k<K; k++) {
-            for(int d = threadIdx.x; d < SHARED_DIM_CHUNK; d += blockDim.x) {
-                int dim_idx = d_start + d;
-                if(dim_idx < DIM) atomicAdd(&sum[k * DIM + dim_idx], s_sum[k][d]);
-            }
-        }
-    }
-    
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < n; i++) atomicAdd(&cnt[labels[i]], 1);
+    int k = labels[i];
+    atomicAdd(&cnt[k], 1);
+    for (int d = 0; d < DIM; d++) {
+        atomicAdd(&sum[k * DIM + d], x[i * DIM + d]);
     }
 }
 
