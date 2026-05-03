@@ -28,37 +28,57 @@ fi
 echo -e "\nStarting Benchmarks on Tesla T4..."
 echo "Format: ./assignment <total_threads> <block_size> [--mini-batch]"
 
-# PHASE 1: Baseline Hardware Limits
-# Tests threads-per-block limits and basic overhead.
-echo -e "\n[TEST 1] Small Workload | Block Size 64"
-./assignment 1024 64
+# ============================================================
+# PHASE 1: BLOCK SIZE EFFECT (CONSTANT WORKLOAD)
+# Goal: isolate occupancy + scheduling effects
+# ============================================================
 
-echo -e "\n[TEST 2] Small Workload | Block Size 1024 (Max Threads/Block)"
-./assignment 1024 1024
+echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
 
-# PHASE 2: Throughput Scaling
-# Demonstrates how the T4 scales as we saturate its 2,560 CUDA cores.
-echo -e "\n[TEST 3] 10k Images | Block Size 256"
+./assignment 10000 32
+./assignment 10000 64
+./assignment 10000 128
 ./assignment 10000 256
+./assignment 10000 512
+./assignment 10000 1024
 
-echo -e "\n[TEST 4] 100k Images | Block Size 256"
+
+# ============================================================
+# PHASE 2: THREAD / GRID SCALING (CONSTANT BLOCK SIZE)
+# Goal: show GPU saturation & throughput scaling
+# ============================================================
+
+echo -e "\n[PHASE 2] Grid Scaling (Block Size = 256 fixed)"
+
+./assignment 1000 256
+./assignment 10000 256
+./assignment 50000 256
 ./assignment 100000 256
+./assignment 1000000 256
 
-# PHASE 3: Algorithm Comparison
-# Explicitly uses the new flag to compare performance.
-echo -e "\n[TEST 5] 10k Images | STANDARD K-MEANS"
+
+# ============================================================
+# PHASE 3: STANDARD vs MINI-BATCH (CONSTANT PARAMS)
+# Goal: isolate algorithmic difference only
+# ============================================================
+
+echo -e "\n[PHASE 3] Standard vs Mini-Batch (N = 10000, Block = 256)"
+
 ./assignment 10000 256
-
-echo -e "\n[TEST 6] 10k Images | MINI-BATCH K-MEANS"
 ./assignment 10000 256 --mini-batch
 
-# PHASE 4: Scheduler & Occupancy Stress
-# Compares high occupancy vs high scheduler overhead.
-echo -e "\n[TEST 7] 1M Images | Block Size 1024 (High Occupancy)"
-./assignment 1000000 1024
 
-echo -e "\n[TEST 8] 1M Images | Block Size 32 (High Scheduler Overhead)"
-./assignment 1000000 32
+# ============================================================
+# PHASE 4: EXTREME OCCUPANCY TEST
+# Goal: stress scheduler and memory system
+# ============================================================
+
+echo -e "\n[PHASE 4] Extreme Scaling Stress Test"
+
+./assignment 1000000 128
+./assignment 1000000 256
+./assignment 1000000 512
+
 
 echo -e "\n--- CSV Reports Generated ---"
 ls -lh *.csv
