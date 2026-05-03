@@ -40,13 +40,13 @@ echo "Format: ./assignment <total_threads> <block_size> [--mini-batch]"
 # Goal: isolate occupancy + scheduling effects
 # ============================================================
 
-echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
+# echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
 
-./assignment 10000 32
-./assignment 10000 64
-./assignment 10000 128
-./assignment 10000 256
-./assignment 10000 512
+# ./assignment 10000 32
+# ./assignment 10000 64
+# ./assignment 10000 128
+# ./assignment 10000 256
+# ./assignment 10000 512
 # ./assignment 10000 1024
 
 
@@ -55,13 +55,13 @@ echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
 # Goal: show GPU saturation & throughput scaling
 # ============================================================
 
-# echo -e "\n[PHASE 2] Grid Scaling (Block Size = 256 fixed)"
+echo -e "\n[PHASE 2] Grid Scaling (Block Size = 256 fixed)"
 
-# ./assignment 1000 256
-# ./assignment 10000 256
-# ./assignment 50000 256
-# ./assignment 100000 256
-# ./assignment 1000000 256
+./assignment 1000 256
+./assignment 10000 256
+./assignment 50000 256
+./assignment 100000 256
+./assignment 1000000 256
 
 
 # # ============================================================
