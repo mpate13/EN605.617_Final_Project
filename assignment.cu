@@ -519,7 +519,7 @@ void load_cifar_dataset(const char* file_path, float* host_pixels,
 
     free(base_buffer);
     // printf("Host buffer filled with %d images (using cyclic data).\n", 
-                                                                num_images);
+                                                                // num_images);
 }
 
 void print_usage(char* prog_name) {
