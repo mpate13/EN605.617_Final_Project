@@ -8,12 +8,14 @@
 #define K 10
 #define DIM 3072
 #define ITER 20
-
 #define NUM_STREAMS 4
 #define CHUNK_SIZE 50000
-
 #define WARP_SIZE 32
 #define TILE_K 2
+#define CIFAR_BINARY_ROW_SIZE 3073
+#define DATASET_SIZE_LIMIT 50000
+#define FIRST_DATA_CHANNEL_OFFSET 1
+#define NORMALIZE_PIXEL_VALUE 255.0f
 
 #define CUDA_CHECK(x) do { \
     cudaError_t err = (x); \
@@ -512,12 +514,12 @@ void load_cifar_dataset(const char* file_path, float* host_pixels,
     for (int i = 0; i < num_images; i++) {
         int source_idx = i % loaded_count;
         memcpy(&host_pixels[i * DIM], &base_buffer[source_idx * DIM], 
-                                                            DIM * sizeof(float));
+                                                        DIM * sizeof(float));
     }
 
     free(base_buffer);
     printf("Host buffer filled with %d images (using cyclic data).\n", 
-                                                                    num_images);
+                                                                num_images);
 }
 
 void print_usage(char* prog_name) {
