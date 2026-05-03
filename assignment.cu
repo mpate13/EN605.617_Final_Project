@@ -27,6 +27,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
 
     for (int it = 0; it < ITER; it++) {
 
+        // assign
         for (int i = 0; i < n; i++) {
             float best = 1e30f;
             int bestk = 0;
@@ -45,12 +46,14 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
             labels[i] = bestk;
         }
 
+        // reset
         for (int k = 0; k < K; k++) {
             cnt[k] = 0;
             for (int d_i = 0; d_i < DIM; d_i++)
-                tmp[k * DIM + d_i] = 0;
+                tmp[k * DIM + d_i] = 0.0f;
         }
 
+        // accumulate
         for (int i = 0; i < n; i++) {
             int k = labels[i];
             cnt[k]++;
@@ -59,6 +62,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
             }
         }
 
+        // normalize
         for (int k = 0; k < K; k++) {
             if (cnt[k] == 0) continue;
             for (int d_i = 0; d_i < DIM; d_i++) {
@@ -68,7 +72,7 @@ void cpu_kmeans(const float* x, float* c, int* labels, int n)
     }
 }
 
-// ---------------- FIXED KERNEL ----------------
+// ---------------- GPU KERNEL ----------------
 
 __global__ void kmeans_kernel_hpc(
     const float* __restrict__ x,
@@ -119,22 +123,24 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     float *d_x[NUM_STREAMS];
     float *d_sum;
-    int *d_cnt;                 // ✅ MUST be int*
-    float *d_c, *d_labels;
+    int *d_cnt;        // ✅ MUST be int*
+    float *d_c;
+    int *d_labels;     // ✅ MUST be int*
 
     int chunk = CHUNK_SIZE;
 
+    // allocations
     for (int s = 0; s < NUM_STREAMS; s++) {
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
-        CUDA_CHECK(cudaMalloc(&d_x[s], (size_t)chunk * DIM * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_x[s], chunk * DIM * sizeof(float)));
     }
 
-    CUDA_CHECK(cudaMalloc(&d_sum, (size_t)K * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_cnt, (size_t)K * sizeof(int)));   // ✅ correct
-    CUDA_CHECK(cudaMalloc(&d_c, (size_t)K * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_labels, (size_t)n * sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_c, c, (size_t)K * DIM * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
@@ -143,8 +149,8 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
 
     for (int it = 0; it < ITER; it++) {
 
-        CUDA_CHECK(cudaMemset(d_sum, 0, (size_t)K * DIM * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_cnt, 0, (size_t)K * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
         for (int offset = 0; offset < n; offset += chunk)
         {
@@ -178,7 +184,7 @@ float gpu_kmeans_streamed(const float* x, float* c, int* labels, int n, int bloc
         for (int s = 0; s < NUM_STREAMS; s++)
             CUDA_CHECK(cudaStreamSynchronize(streams[s]));
 
-        CUDA_CHECK(cudaMemcpy(c, d_c, (size_t)K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(c, d_c, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
     }
 
     CUDA_CHECK(cudaEventRecord(stop));
