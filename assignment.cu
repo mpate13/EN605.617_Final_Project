@@ -421,15 +421,18 @@ void export_benchmark_results(int* cpu_results,
 void allocate_host_resources(int total_image_count, 
                              float** pixels, 
                              int** gpu_res, 
-                             int** cpu_res) {
+                             int** cpu_res,
+                             int* use_pinned) {
     size_t pixel_size = (size_t)total_image_count * IMAGE_DIMENSIONS * sizeof(float);
     size_t result_size = (size_t)total_image_count * sizeof(int);
+    *used_pinned = 1;
 
     cudaError_t err = cudaHostAlloc(pixels, pixel_size, cudaHostAllocDefault);
 
     if (err != cudaSuccess) {
         printf("Warning: cudaHostAlloc failed, falling back to malloc.\n");
         *pixels = (float*)malloc(pixel_size);
+        *used_pinned = 0;
     }
 
     *gpu_res = (int*)malloc(result_size);
@@ -456,16 +459,15 @@ void initialize_dataset(float* host_pixel_buffer, int total_image_count) {
  * HOST FUNCTION: cleanup_host_resources
  * Ensures all heap memory is properly released.
  */
-void cleanup_host_resources(float* pixels, int* gpu_res, int* cpu_res) {
+void cleanup_host_resources(float* pixels, int* gpu_res, int* cpu_res, int used_pinned) {
     if (pixels) {
-        cudaPointerAttributes attr;
-        if (cudaPointerGetAttributes(&attr, pixels) == cudaSuccess &&
-            attr.type == cudaMemoryTypeHost) {
+        if (used_pinned) {
             cudaFreeHost(pixels);
         } else {
             free(pixels);
         }
     }
+
     if (gpu_res) free(gpu_res);
     if (cpu_res) free(cpu_res);
 }
@@ -491,8 +493,11 @@ int main(int argc, char** argv) {
     int *gpu_results = NULL;
     int *cpu_results = NULL;
 
+    int used_pinned = 1;
+
     allocate_host_resources(total_image_count, &host_pixel_buffer, 
-                            &gpu_results, &cpu_results);
+                        &gpu_results, &cpu_results,
+                        &used_pinned);
 
     initialize_dataset(host_pixel_buffer, total_image_count);
 
@@ -505,7 +510,6 @@ int main(int argc, char** argv) {
                              total_image_count, threads_per_block, 
                              execution_mode);
 
-    cleanup_host_resources(host_pixel_buffer, gpu_results, cpu_results);
-
+    cleanup_host_resources(host_pixel_buffer, gpu_results, cpu_results, used_pinned);
     return SUCCESS_EXIT_CODE;
 }
