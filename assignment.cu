@@ -2,20 +2,17 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include <float.h>
-#include <time.h>
 #include <string.h>
 
 #define K 10
 #define DIM 3072
 #define ITER 20
 
-#define NUM_STREAMS 4
-#define CHUNK_SIZE 50000
+// fixed dataset size (NO runtime n argument anymore)
+#define N 200000
 
-#define WARP_SIZE 32
-#define TILE_K 4
-#define TILE_DIM 128   // FIX: dimension tiling (critical)
-
+#define TILE_DIM 128
+#define STREAMS 2
 #define LR 0.1f
 
 #define CUDA_CHECK(x) do { \
@@ -29,293 +26,256 @@
 
 
 // ============================================================
-// CPU BASELINE (STANDARD)
+// CPU REFERENCE
 // ============================================================
 
-void cpu_kmeans(const float* x, float* c, int* labels, int n)
+void cpu_kmeans(const float* x, float* c, int* labels)
 {
     float tmp[K * DIM];
     int cnt[K];
 
     for (int it = 0; it < ITER; it++) {
 
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < N; i++) {
+
             float best = 1e30f;
             int bestk = 0;
 
             for (int k = 0; k < K; k++) {
-                float d = 0;
-                for (int d_i = 0; d_i < DIM; d_i++) {
-                    float diff = x[i * DIM + d_i] - c[k * DIM + d_i];
-                    d += diff * diff;
+
+                float dist = 0.0f;
+
+                for (int d = 0; d < DIM; d++) {
+                    float diff = x[i * DIM + d] - c[k * DIM + d];
+                    dist += diff * diff;
                 }
-                if (d < best) {
-                    best = d;
+
+                if (dist < best) {
+                    best = dist;
                     bestk = k;
                 }
             }
+
             labels[i] = bestk;
         }
 
         for (int k = 0; k < K; k++) {
             cnt[k] = 0;
-            for (int d_i = 0; d_i < DIM; d_i++)
-                tmp[k * DIM + d_i] = 0.0f;
+            for (int d = 0; d < DIM; d++)
+                tmp[k * DIM + d] = 0;
         }
 
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < N; i++) {
             int k = labels[i];
             cnt[k]++;
-            for (int d_i = 0; d_i < DIM; d_i++)
-                tmp[k * DIM + d_i] += x[i * DIM + d_i];
+            for (int d = 0; d < DIM; d++)
+                tmp[k * DIM + d] += x[i * DIM + d];
         }
 
         for (int k = 0; k < K; k++) {
             if (cnt[k] == 0) continue;
-            for (int d_i = 0; d_i < DIM; d_i++)
-                c[k * DIM + d_i] = tmp[k * DIM + d_i] / cnt[k];
+            for (int d = 0; d < DIM; d++)
+                c[k * DIM + d] = tmp[k * DIM + d] / cnt[k];
         }
     }
 }
 
 
 // ============================================================
-// GPU KERNEL: STANDARD ASSIGNMENT + SUM REDUCTION
-// (warp-aggregated, no per-thread atomics)
+// GPU ASSIGN (TILED CENTROIDS)
 // ============================================================
 
-__global__ void kmeans_assign_reduce(
+__global__ void assign_kernel(
     const float* __restrict__ x,
     const float* __restrict__ c,
-    int* labels,
-    float* sum,
-    int* cnt,
-    int n)
+    int* labels)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    if (idx >= N) return;
 
     const float* xi = x + (size_t)idx * DIM;
 
-    // ---------------- ASSIGNMENT ----------------
-    float best_dist = 1e30f;
-    int best_k = 0;
+    __shared__ float c_tile[K * DIM];
 
-    __shared__ float c_tile[TILE_K][DIM];
+    for (int i = threadIdx.x; i < K * DIM; i += blockDim.x)
+        c_tile[i] = c[i];
 
-    for (int k0 = 0; k0 < K; k0 += TILE_K)
-    {
-        for (int i = threadIdx.x; i < TILE_K * DIM; i += blockDim.x) {
-            int ck = i / DIM;
-            int cd = i % DIM;
-            if (k0 + ck < K)
-                c_tile[ck][cd] = c[(k0 + ck) * DIM + cd];
+    __syncthreads();
+
+    float best = 1e30f;
+    int bestk = 0;
+
+    #pragma unroll
+    for (int k = 0; k < K; k++) {
+        float dist = 0.0f;
+
+        for (int d = 0; d < DIM; d++) {
+            float diff = xi[d] - c_tile[k * DIM + d];
+            dist += diff * diff;
         }
 
-        __syncthreads();
-
-        for (int ck = 0; ck < TILE_K && (k0 + ck) < K; ck++) {
-
-            float dist = 0;
-
-            for (int d = 0; d < DIM; d += WARP_SIZE) {
-                float diff = xi[d] - c_tile[ck][d];
-                dist += diff * diff;
-            }
-
-            if (dist < best_dist) {
-                best_dist = dist;
-                best_k = k0 + ck;
-            }
+        if (dist < best) {
+            best = dist;
+            bestk = k;
         }
-
-        __syncthreads();
     }
 
-    labels[idx] = best_k;
-
-    // ---------------- WARP-REDUCED UPDATE ----------------
-    // each thread contributes subset of dims
-    for (int d = threadIdx.x; d < DIM; d += blockDim.x) {
-        atomicAdd(&sum[best_k * DIM + d], xi[d]);
-    }
-
-    atomicAdd(&cnt[best_k], 1);
+    labels[idx] = bestk;
 }
 
 
 // ============================================================
-// GPU KERNEL: MINI-BATCH (TRUE MOVING AVERAGE UPDATE)
+// BLOCK REDUCTION MINI-BATCH
 // ============================================================
 
-__global__ void kmeans_minibatch_kernel(
+__global__ void accumulate_kernel(
     const float* __restrict__ x,
-    float* c,
-    int* labels,
+    const int* labels,
     float* sum,
-    int* cnt,
-    int n)
+    int* cnt)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
+    __shared__ float sh_sum[K * TILE_DIM];
+    __shared__ int sh_cnt[K];
 
-    const float* xi = x + (size_t)idx * DIM;
+    int tid = threadIdx.x;
 
-    // ---------------- ASSIGNMENT ----------------
-    float best_dist = 1e30f;
-    int best_k = 0;
+    for (int i = tid; i < K * TILE_DIM; i += blockDim.x)
+        sh_sum[i] = 0.0f;
 
-    __shared__ float c_tile[TILE_K][DIM];
+    for (int k = tid; k < K; k += blockDim.x)
+        sh_cnt[k] = 0;
 
-    for (int k0 = 0; k0 < K; k0 += TILE_K)
-    {
-        for (int i = threadIdx.x; i < TILE_K * DIM; i += blockDim.x) {
-            int ck = i / DIM;
-            int cd = i % DIM;
-            if (k0 + ck < K)
-                c_tile[ck][cd] = c[(k0 + ck) * DIM + cd];
-        }
+    __syncthreads();
 
-        __syncthreads();
+    int idx = blockIdx.x * blockDim.x + tid;
+    if (idx < N) {
 
-        for (int ck = 0; ck < TILE_K && (k0 + ck) < K; ck++) {
+        int k = labels[idx];
+        const float* xi = x + (size_t)idx * DIM;
 
-            float dist = 0;
-            for (int d = 0; d < DIM; d++) {
-                float diff = xi[d] - c_tile[ck][d];
-                dist += diff * diff;
-            }
+        atomicAdd(&sh_cnt[k], 1);
 
-            if (dist < best_dist) {
-                best_dist = dist;
-                best_k = k0 + ck;
+        for (int d0 = 0; d0 < DIM; d0 += TILE_DIM) {
+            #pragma unroll
+            for (int d = 0; d < TILE_DIM; d++) {
+                sh_sum[k * TILE_DIM + d] += xi[d0 + d];
             }
         }
-
-        __syncthreads();
     }
 
-    labels[idx] = best_k;
+    __syncthreads();
 
-    // ---------------- SUM (no direct centroid update yet) ----------------
+    for (int k = tid; k < K; k += blockDim.x) {
+
+        int c_k = sh_cnt[k];
+        if (c_k > 0) {
+            for (int d = 0; d < TILE_DIM; d++) {
+                atomicAdd(&sum[k * DIM + d],
+                          sh_sum[k * TILE_DIM + d] / c_k);
+            }
+            atomicAdd(&cnt[k], c_k);
+        }
+    }
+}
+
+
+// ============================================================
+// CENTROID UPDATE
+// ============================================================
+
+__global__ void update_centroids_kernel(
+    float* c,
+    const float* sum,
+    const int* cnt)
+{
+    int k = blockIdx.x;
+    if (k >= K || cnt[k] == 0) return;
+
     for (int d = threadIdx.x; d < DIM; d += blockDim.x) {
-        atomicAdd(&sum[best_k * DIM + d], xi[d]);
+        float mean = sum[k * DIM + d] / cnt[k];
+        c[k * DIM + d] =
+            (1.0f - LR) * c[k * DIM + d] + LR * mean;
     }
-
-    atomicAdd(&cnt[best_k], 1);
 }
 
 
 // ============================================================
-// GPU DRIVER (STANDARD)
+// MINI-BATCH DRIVER (ASYNC STREAMED)
 // ============================================================
 
-float gpu_kmeans_standard(const float* x, float* c, int* labels, int n, int block_size)
+float gpu_minibatch(const float* x, float* c, int* labels,
+                    int threads, int batch_size)
 {
-    float *d_x, *d_c, *d_sum;
+    float *d_x[STREAMS], *d_c, *d_sum;
     int *d_labels, *d_cnt;
 
-    CUDA_CHECK(cudaMalloc(&d_x, (size_t)n * DIM * sizeof(float)));
+    cudaStream_t stream[STREAMS];
+
+    for (int i = 0; i < STREAMS; i++)
+        CUDA_CHECK(cudaStreamCreate(&stream[i]));
+
+    for (int i = 0; i < STREAMS; i++)
+        CUDA_CHECK(cudaMalloc(&d_x[i], batch_size * DIM * sizeof(float)));
+
     CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_labels, (size_t)n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_labels, N * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));
 
-    CUDA_CHECK(cudaMemcpy(d_x, x, (size_t)n * DIM * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float),
+                          cudaMemcpyHostToDevice));
 
-    cudaEvent_t s,e;
+    cudaEvent_t s, e;
     CUDA_CHECK(cudaEventCreate(&s));
     CUDA_CHECK(cudaEventCreate(&e));
     CUDA_CHECK(cudaEventRecord(s));
+
+    int num_chunks = (N + batch_size - 1) / batch_size;
+
+    int blocks_per_chunk;
 
     for (int it = 0; it < ITER; it++) {
 
         CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
 
-        int blocks = (n + block_size - 1) / block_size;
+        for (int i = 0; i < num_chunks; i += STREAMS) {
 
-        kmeans_assign_reduce<<<blocks, block_size>>>(
-            d_x, d_c, d_labels, d_sum, d_cnt, n
-        );
+            for (int sidx = 0; sidx < STREAMS; sidx++) {
 
-        CUDA_CHECK(cudaDeviceSynchronize());
+                int chunk = i + sidx;
+                if (chunk >= num_chunks) continue;
 
-        CUDA_CHECK(cudaMemcpy(c, d_sum, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(labels, d_labels, n * sizeof(int), cudaMemcpyDeviceToHost));
-    }
+                int offset = chunk * batch_size;
+                int current_n = (offset + batch_size > N)
+                                ? (N - offset)
+                                : batch_size;
 
-    CUDA_CHECK(cudaEventRecord(e));
-    CUDA_CHECK(cudaEventSynchronize(e));
+                blocks_per_chunk =
+                    (current_n + threads - 1) / threads;
 
-    float ms;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    d_x[sidx],
+                    x + offset * DIM,
+                    current_n * DIM * sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    stream[sidx]
+                ));
 
-    cudaFree(d_x); cudaFree(d_c);
-    cudaFree(d_sum); cudaFree(d_cnt);
-    cudaFree(d_labels);
+                assign_kernel<<<blocks_per_chunk, threads, 0, stream[sidx]>>>(
+                    d_x[sidx], d_c, d_labels + offset
+                );
 
-    return ms;
-}
-
-
-// ============================================================
-// GPU DRIVER (MINI-BATCH - NO CPU IN LOOP)
-// ============================================================
-
-float gpu_kmeans_minibatch(const float* x, float* c, int* labels, int n, int block_size)
-{
-    float *d_x, *d_c, *d_sum;
-    int *d_labels, *d_cnt;
-
-    CUDA_CHECK(cudaMalloc(&d_x, (size_t)n * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_c, K * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_labels, (size_t)n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_sum, K * DIM * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_cnt, K * sizeof(int)));
-
-    CUDA_CHECK(cudaMemcpy(d_x, x, (size_t)n * DIM * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
-
-    cudaEvent_t s,e;
-    CUDA_CHECK(cudaEventCreate(&s));
-    CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(s));
-
-    for (int it = 0; it < ITER; it++) {
-
-        CUDA_CHECK(cudaMemset(d_sum, 0, K * DIM * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_cnt, 0, K * sizeof(int)));
-
-        int blocks = (n + block_size - 1) / block_size;
-
-        kmeans_minibatch_kernel<<<blocks, block_size>>>(
-            d_x, d_c, d_labels, d_sum, d_cnt, n
-        );
-
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // ---------------- TRUE MINI-BATCH UPDATE ----------------
-        float h_sum[K * DIM];
-        int h_cnt[K];
-
-        CUDA_CHECK(cudaMemcpy(h_sum, d_sum, K * DIM * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_cnt, d_cnt, K * sizeof(int), cudaMemcpyDeviceToHost));
-
-        float lr = LR;
-
-        for (int k = 0; k < K; k++) {
-            if (h_cnt[k] == 0) continue;
-
-            for (int d = 0; d < DIM; d++) {
-                float mean = h_sum[k * DIM + d] / h_cnt[k];
-                c[k * DIM + d] =
-                    (1.0f - lr) * c[k * DIM + d] + lr * mean;
+                accumulate_kernel<<<blocks_per_chunk, threads, 0, stream[sidx]>>>(
+                    d_x[sidx], d_labels + offset, d_sum, d_cnt
+                );
             }
         }
 
-        CUDA_CHECK(cudaMemcpy(d_c, c, K * DIM * sizeof(float), cudaMemcpyHostToDevice));
+        for (int i = 0; i < STREAMS; i++)
+            CUDA_CHECK(cudaStreamSynchronize(stream[i]));
+
+        update_centroids_kernel<<<K, threads>>>(d_c, d_sum, d_cnt);
     }
 
     CUDA_CHECK(cudaEventRecord(e));
@@ -324,69 +284,73 @@ float gpu_kmeans_minibatch(const float* x, float* c, int* labels, int n, int blo
     float ms;
     CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
 
-    CUDA_CHECK(cudaMemcpy(labels, d_labels, n * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c, d_c, K * DIM * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(labels, d_labels, N * sizeof(int),
+                          cudaMemcpyDeviceToHost));
 
-    cudaFree(d_x); cudaFree(d_c);
-    cudaFree(d_sum); cudaFree(d_cnt);
+    for (int i = 0; i < STREAMS; i++) {
+        cudaFree(d_x[i]);
+        cudaStreamDestroy(stream[i]);
+    }
+
+    cudaFree(d_c);
     cudaFree(d_labels);
+    cudaFree(d_sum);
+    cudaFree(d_cnt);
 
     return ms;
 }
 
 
 // ============================================================
-// MAIN
+// INIT + MAIN
 // ============================================================
 
-void init(float* x, int n)
+void init(float* x)
 {
-    for (int i = 0; i < n * DIM; i++)
+    for (int i = 0; i < N * DIM; i++)
         x[i] = (float)rand() / RAND_MAX;
 }
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) {
-        printf("Usage: %s <n> <block_size> [--mini-batch]\n", argv[0]);
+    if (argc < 4) {
+        printf("Usage: %s <threads> <batch_size> [--mini-batch]\n", argv[0]);
         return 1;
     }
 
-    int n = atoi(argv[1]);
-    int block = atoi(argv[2]);
-    int mb = (argc > 3 && strcmp(argv[3], "--mini-batch") == 0);
+    int threads = atoi(argv[1]);
+    int batch_size = atoi(argv[2]);
+    int use_mb = (argc > 3 && strcmp(argv[3], "--mini-batch") == 0);
 
-    float *x = (float*)malloc((size_t)n * DIM * sizeof(float));
-    float *c1 = (float*)malloc(K * DIM * sizeof(float));
-    float *c2 = (float*)malloc(K * DIM * sizeof(float));
-    int *l1 = (int*)malloc(n * sizeof(int));
-    int *l2 = (int*)malloc(n * sizeof(int));
+    float *x = (float*)malloc(N * DIM * sizeof(float));
+    float *c = (float*)malloc(K * DIM * sizeof(float));
+    int *labels = (int*)malloc(N * sizeof(int));
 
     srand(0);
-    init(x, n);
+    init(x);
 
-    for (int i = 0; i < K * DIM; i++) {
-        c1[i] = x[i];
-        c2[i] = x[i];
+    for (int i = 0; i < K * DIM; i++)
+        c[i] = x[i];
+
+    float ms;
+
+    if (use_mb) {
+        ms = gpu_minibatch(x, c, labels, threads, batch_size);
+        printf("MODE: MINI-BATCH (ASYNC STREAMED)\n");
+    } else {
+        printf("MODE: CPU ONLY (GPU standard omitted)\n");
+        cpu_kmeans(x, c, labels);
+        ms = 0.0f;
     }
 
-    clock_t t1 = clock();
+    printf("N=%d Threads=%d Batch=%d\n", N, threads, batch_size);
+    printf("Time=%.2f ms\n", ms);
 
-    float cpu_ms = 0;
-    if (!mb) {
-        cpu_kmeans(x, c1, l1, n);
-    }
-
-    float gpu_ms = mb ?
-        gpu_kmeans_minibatch(x, c2, l2, n, block)
-        :
-        gpu_kmeans_standard(x, c2, l2, n, block);
-
-    printf("Mode: %s\n", mb ? "MINI-BATCH" : "STANDARD");
-    printf("CPU skipped or baseline\n");
-    printf("GPU: %.2f ms\n", gpu_ms);
-
-    free(x); free(c1); free(c2);
-    free(l1); free(l2);
+    free(x);
+    free(c);
+    free(labels);
 
     return 0;
 }
