@@ -41,7 +41,7 @@
 #define FIRST_DATA_CHANNEL_OFFSET 1  
 #define FILENAME_BUFFER_SIZE 256
 #define NUM_STREAMS 4
-#define TILE_DIM 128
+#define TILE_DIM 64
 
 
 __managed__ float g_accumulated_centroids[MAX_CLUSTERS * IMAGE_DIMENSIONS];
@@ -126,7 +126,7 @@ __global__ void assignment_kernel(const float* device_pixels,
         }
     }
 
-    device_assignments[thread_id + global_offset] = closest_cluster_id;
+    device_assignments[thread_id] = closest_cluster_id;
 }
 
 /**
@@ -142,7 +142,7 @@ __global__ void update_kernel(const float* device_pixels,
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id >= image_count) return;
 
-    int global_image_idx = thread_id + global_offset;
+    int global_image_idx = thread_id;
     int assigned_cluster = device_assignments[global_image_idx];
 
     atomicAdd(&g_cluster_population[assigned_cluster], 1);
@@ -263,8 +263,11 @@ void load_cifar_dataset(const char* file_path, float* host_pixels,
  * core kernels.
  */
 void dispatch_gpu_step(float* device_pixels, 
-                        int* device_assignments, int batch_size, int clusters, 
-                        int threads, int total_n, cudaStream_t stream, int offset) {
+                       int* device_assignments, 
+                       int batch_size, 
+                       int clusters, 
+                       int threads, 
+                       cudaStream_t stream) {
     int blocks = (batch_size + threads - 1) / threads;
     size_t shared_size = (size_t)threads * TILE_DIM * sizeof(float);
 
@@ -318,7 +321,7 @@ float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n,
         // Iterate kernels on resident data
         for (int i = 0; i < MAX_ITERATIONS; i++) {
             dispatch_gpu_step(device_pixel_buffer, device_assignment_buffer, 
-                current_chunk, k, threads, total_n, streams[s_idx], offset);
+                current_chunk, k, threads, current_chunk, streams[s_idx], offset);
         }
     }
     
@@ -435,12 +438,13 @@ void allocate_host_resources(int total_image_count,
                              int* used_pinned) {
     size_t pixel_size = (size_t)total_image_count * IMAGE_DIMENSIONS * sizeof(float);
     size_t result_size = (size_t)total_image_count * sizeof(int);
+
     *used_pinned = 1;
 
     cudaError_t err = cudaHostAlloc(pixels, pixel_size, cudaHostAllocDefault);
 
-    if (err != cudaSuccess) {
-        printf("Warning: cudaHostAlloc failed, falling back to malloc.\n");
+    if (err != cudaSuccess || pixel_size > (size_t)2e9) {
+        printf("Warning: cudaHostAlloc failed or too large, using malloc.\n");
         *pixels = (float*)malloc(pixel_size);
         *used_pinned = 0;
     }
