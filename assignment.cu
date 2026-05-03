@@ -45,6 +45,19 @@
 __managed__ float g_accumulated_centroids[MAX_CLUSTERS * IMAGE_DIMENSIONS];
 __managed__ int g_cluster_population[MAX_CLUSTERS];
 
+/**
+ * KERNEL: reset_accumulators_kernel
+ * Resets accumulator state for the new training iteration.
+ */
+__global__ void reset_accumulators_kernel(int num_clusters) {
+    int cluster_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cluster_idx >= num_clusters) return;
+
+    g_cluster_population[cluster_idx] = 0;
+    for (int dim_idx = 0; dim_idx < IMAGE_DIMENSIONS; dim_idx++) {
+        g_accumulated_centroids[cluster_idx * IMAGE_DIMENSIONS + dim_idx] = 0.0f;
+    }
+}
 
 /**
  * DEVICE FUNCTION: find_nearest_cluster
@@ -76,9 +89,8 @@ __device__ int find_nearest_cluster(const float* image_pixels,
 /**
  * KERNEL: assignment_kernel
  * Assignment Phase: Assigns images to clusters. 
- * To minimize Global Memory transactions, this kernel stages the 
- * high-dimensional image data into Shared Memory (shared_pixel_buffer)
- * before calling the distance calculation logic.
+ * Minimizes Global Memory transactions by staging the high-dimensional 
+ * image data into Shared Memory.
  */
 __global__ void assignment_kernel(const float* __restrict__ device_pixels, 
                                   const float* __restrict__ device_centroids,
@@ -87,28 +99,30 @@ __global__ void assignment_kernel(const float* __restrict__ device_pixels,
                                   int num_clusters, 
                                   int global_offset) {
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    
     if (thread_id >= image_count) return;
 
-    // Direct pointer to this thread's specific image in Global Memory
-    const float* thread_image = &device_pixels[thread_id * IMAGE_DIMENSIONS];
+    __shared__ float s_image[IMAGE_DIMENSIONS];
 
-    // find_nearest_cluster now reads directly from Global Memory
-    // The hardware RO Cache automatically tiles/caches this for you.
+    // Cooperatively tile/load image pixels into shared memory
+    for (int d = threadIdx.x; d < IMAGE_DIMENSIONS; d += blockDim.x) {
+        s_image[d] = device_pixels[thread_id * IMAGE_DIMENSIONS + d];
+    }
+    __syncthreads();
+
+    // The assignment step uses the cached shared memory vector
     device_assignments[thread_id + global_offset] = 
-        find_nearest_cluster(thread_image, device_centroids, num_clusters);
+        find_nearest_cluster(s_image, device_centroids, num_clusters);
 }
 
 /**
  * KERNEL: update_kernel
  * Update Phase: Aggregates image pixel values for each cluster. 
- * It uses atomicAdd on __managed__ memory buffers to safely accumulate 
- * dimensions and population 
- * counts across multiple thread blocks without race conditions.
+ * Uses atomicAdd on __managed__ memory buffers to safely accumulate dimensions 
+ * and population counts across multiple thread blocks without race conditions.
  */
 __global__ void update_kernel(const float* device_pixels, 
-                                const int* device_assignments, 
-                                int image_count, int global_offset) {
+                              const int* device_assignments, 
+                              int image_count, int global_offset) {
     int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (thread_id >= image_count) return;
 
@@ -126,8 +140,7 @@ __global__ void update_kernel(const float* device_pixels,
 /**
  * KERNEL: finalize_centroids_kernel
  * Normalization Phase: Calculates the new mean (centroid) for each cluster by 
- * dividing the accumulated sums by the total cluster population. It also resets 
- * the managed population counters for the next training iteration.
+ * dividing the accumulated sums by the total cluster population.
  */
 __global__ void finalize_centroids_kernel(int num_clusters) {
     int cluster_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -139,7 +152,6 @@ __global__ void finalize_centroids_kernel(int num_clusters) {
             int offset = cluster_idx * IMAGE_DIMENSIONS + dim_idx;
             g_accumulated_centroids[offset] /= (float)current_population;
         }
-        g_cluster_population[cluster_idx] = 0; 
     }
 }
 
@@ -147,10 +159,9 @@ __global__ void finalize_centroids_kernel(int num_clusters) {
  * HOST FUNCTION: export_to_csv
  * Formats and writes the cluster assignment results (ImageID, ClusterID) 
  * to a CSV file. 
- * This enables external validation and visualization of the clustering results.
  */
 void export_to_csv(const char* filename, const int* assignments, 
-                    int total_images) {
+                   int total_images) {
     FILE* file_pointer = fopen(filename, "w");
     if (!file_pointer) return;
     fprintf(file_pointer, "ImageID,ClusterID\n");
@@ -164,11 +175,9 @@ void export_to_csv(const char* filename, const int* assignments,
 /**
  * HOST FUNCTION: execute_cpu_baseline
  * Implements a standard, single-threaded K-Means assignment loop on the CPU.
- * This serves as the baseline for calculating the GPU speedup factor and 
- * verifying the mathematical correctness of the GPU kernels.
  */
 void execute_cpu_baseline(const float* host_pixels, int* cpu_results, 
-                            const float* centroids, int n, int k) {
+                          const float* centroids, int n, int k) {
     for (int i = 0; i < n; i++) {
         float min_dist = FLT_MAX;
         int best_id = 0;
@@ -198,8 +207,7 @@ void setup_gpu_centroids(float* host_pixel_buffer) {
 }
 
 /**
- * UPDATED HOST FUNCTION: load_cifar_dataset
- * Now handles the return value of fread to satisfy compiler warnings.
+ * HOST FUNCTION: load_cifar_dataset
  */
 void load_cifar_dataset(const char* file_path, float* host_pixels, 
                         int num_images) {
@@ -228,29 +236,23 @@ void load_cifar_dataset(const char* file_path, float* host_pixels,
 
 /**
  * HOST FUNCTION: dispatch_gpu_step
- * Executes a single K-Means training iteration. It handles the random sampling 
- * for mini-batching, calculates thread block counts, launches the three 
- * core kernels.
+ * Executes the assignment and update phases within an iteration.
  */
 void dispatch_gpu_step(float* device_pixels, 
-                        int* device_assignments, int batch_size, int clusters, 
-                        int threads, int total_n, cudaStream_t stream, int offset) {
+                       int* device_assignments, int batch_size, int clusters, 
+                       int threads, int total_n, cudaStream_t stream, int offset) {
     int blocks = (batch_size + threads - 1) / threads;
     
-    // Set shared_size to 0; no shared memory needed for the images
     assignment_kernel<<<blocks, threads, 0, stream>>>(device_pixels, 
         g_accumulated_centroids, device_assignments, batch_size, clusters, offset);
         
     update_kernel<<<blocks, threads, 0, stream>>>(device_pixels, device_assignments, 
         batch_size, offset);
-        
-    finalize_centroids_kernel<<<1, clusters, 0, stream>>>(clusters);
 }
 
 /**
  * HOST FUNCTION: run_gpu_benchmark
- * Orchestrates the GPU training process. Uses Tiling and persistent VRAM residency
- * to maximize throughput and eliminate PCIe bottlenecks.
+ * Orchestrates the GPU training process across both chunks and iterations.
  */
 float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n, 
                         int k, int batch, int threads) {
@@ -269,20 +271,34 @@ float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n,
     cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    // BOTTLE NECK ELIMINATED: Data transferred once before the iteration loop.
-    for (int offset = 0; offset < total_n; offset += chunk_size) {
-        int current_chunk = (offset + chunk_size > total_n) ? (total_n - offset) : chunk_size;
-        int s_idx = (offset / chunk_size) % NUM_STREAMS;
+    // Iteration loop sits at the outermost level
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+        
+        // Reset accumulation buffers per iteration over the entire dataset
+        int reset_blocks = (k + threads - 1) / threads;
+        reset_accumulators_kernel<<<reset_blocks, threads>>>(k);
+        cudaDeviceSynchronize();
 
-        cudaMemcpyAsync(device_pixel_buffer, host_pixels + (size_t)offset * IMAGE_DIMENSIONS, 
-            (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float), 
-            cudaMemcpyHostToDevice, streams[s_idx]);
+        for (int offset = 0; offset < total_n; offset += chunk_size) {
+            int current_chunk = (offset + chunk_size > total_n) ? (total_n - offset) : chunk_size;
+            int s_idx = (offset / chunk_size) % NUM_STREAMS;
 
-        // Iterate kernels on resident data
-        for (int i = 0; i < MAX_ITERATIONS; i++) {
+            cudaMemcpyAsync(device_pixel_buffer, host_pixels + (size_t)offset * IMAGE_DIMENSIONS, 
+                (size_t)current_chunk * IMAGE_DIMENSIONS * sizeof(float), 
+                cudaMemcpyHostToDevice, streams[s_idx]);
+
             dispatch_gpu_step(device_pixel_buffer, device_assignment_buffer, 
                 current_chunk, k, threads, total_n, streams[s_idx], offset);
         }
+
+        for (int i = 0; i < NUM_STREAMS; i++) {
+            cudaStreamSynchronize(streams[i]);
+        }
+
+        // Finalize centroids for the current iteration
+        int finalize_blocks = (k + threads - 1) / threads;
+        finalize_centroids_kernel<<<finalize_blocks, threads>>>(k);
+        cudaDeviceSynchronize();
     }
     
     cudaEventRecord(stop);
@@ -297,11 +313,8 @@ float run_gpu_benchmark(float* host_pixels, int* gpu_results, int total_n,
     return elapsed_ms;
 }
 
-
 /**
  * HOST FUNCTION: parse_arguments
- * Extracts CLI arguments and determines if stochastic mini-batching 
- * should be enabled based on the presence of the --mini-batch flag.
  */
 void parse_arguments(int argc, char** argv, int* total_image_count, 
                      int* threads_per_block, int* batch_size, 
@@ -321,7 +334,6 @@ void parse_arguments(int argc, char** argv, int* total_image_count,
 
 /**
  * HOST FUNCTION: display_usage
- * Prints helpful guidance if command-line arguments are missing.
  */
 void display_usage(const char* program_name) {
     printf("USAGE:\n");
@@ -336,7 +348,6 @@ void display_usage(const char* program_name) {
 
 /**
  * HOST FUNCTION: run_performance_comparison
- * Orchestrates the CPU and GPU timing logic and prints results.
  */
 void run_performance_comparison(float* host_pixel_buffer,
                                 int* cpu_results,
@@ -367,7 +378,6 @@ void run_performance_comparison(float* host_pixel_buffer,
 
 /**
  * HOST FUNCTION: export_benchmark_results
- * Generates filenames and triggers CSV exports for validation.
  */
 void export_benchmark_results(int* cpu_results,
                               int* gpu_results,
@@ -388,7 +398,6 @@ void export_benchmark_results(int* cpu_results,
 
 /**
  * HOST FUNCTION: allocate_host_resources
- * Handles the memory requests for the image buffer and result arrays.
  */
 void allocate_host_resources(int total_image_count, 
                              float** pixels, 
@@ -409,7 +418,6 @@ void allocate_host_resources(int total_image_count,
 
 /**
  * HOST FUNCTION: initialize_dataset
- * Coordinates loading raw binary data and setting up the GPU centroids.
  */
 void initialize_dataset(float* host_pixel_buffer, int total_image_count) {
     load_cifar_dataset("data_batch_1.bin", 
@@ -420,7 +428,6 @@ void initialize_dataset(float* host_pixel_buffer, int total_image_count) {
 
 /**
  * HOST FUNCTION: cleanup_host_resources
- * Ensures all heap memory is properly released.
  */
 void cleanup_host_resources(float* pixels, int* gpu_res, int* cpu_res) {
     if (pixels) cudaFreeHost(pixels);
@@ -430,7 +437,6 @@ void cleanup_host_resources(float* pixels, int* gpu_res, int* cpu_res) {
 
 /**
  * MAIN: Application controller.
- * Orchestrates the modular steps of the benchmarking process.
  */
 int main(int argc, char** argv) {
     if (argc < 3) {
