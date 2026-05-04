@@ -152,6 +152,8 @@ The application outputs the results of the comparison between the single-threade
     - **Speedup Factor:** The calculated performance gain (ex: 8.55x).
 
 These were manually exported into CSV format and graphed with `plot_results.py`
+- results in phaseX_xxx.csv
+- proof of runs in `proof_of_run` directory
 
 2. Validation & Export
 The program generates CSV reports (e.g., gpu_n1000000_b32_standard.csv) for every run. These files contain:
