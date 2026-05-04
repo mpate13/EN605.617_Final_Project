@@ -43,11 +43,11 @@ echo "Format: ./assignment <total_threads> <block_size> [--mini-batch]"
 echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
 
 ./assignment 10000 32
-# ./assignment 10000 64
-# ./assignment 10000 128
-# ./assignment 10000 256
-# ./assignment 10000 512
-# ./assignment 10000 1024
+./assignment 10000 64
+./assignment 10000 128
+./assignment 10000 256
+./assignment 10000 512
+./assignment 10000 1024
 
 
 # ============================================================
@@ -58,10 +58,10 @@ echo -e "\n[PHASE 1] Block Size Scaling (N = 10000 fixed)"
 echo -e "\n[PHASE 2] Grid Scaling (Block Size = 256 fixed)"
 
 ./assignment 1000 256
-# ./assignment 10000 256
-# ./assignment 50000 256
-# ./assignment 100000 256
-# ./assignment 1000000 256
+./assignment 10000 256
+./assignment 50000 256
+./assignment 100000 256
+./assignment 1000000 256
 
 
 # # ============================================================
@@ -72,10 +72,10 @@ echo -e "\n[PHASE 2] Grid Scaling (Block Size = 256 fixed)"
 echo -e "\n[PHASE 3] Mini-Batch Scaling (Block Size = 256)"
 
 ./assignment 1000 256 --mini-batch
-# ./assignment 10000 256 --mini-batch
-# ./assignment 50000 256 --mini-batch
-# ./assignment 100000 256 --mini-batch
-# ./assignment 1000000 256 --mini-batch
+./assignment 10000 256 --mini-batch
+./assignment 50000 256 --mini-batch
+./assignment 100000 256 --mini-batch
+./assignment 1000000 256 --mini-batch
 
 
 # ============================================================
@@ -83,14 +83,14 @@ echo -e "\n[PHASE 3] Mini-Batch Scaling (Block Size = 256)"
 # Goal: stress scheduler and memory system
 # ============================================================
 
-# echo -e "\n[PHASE 4] Extreme Scaling Stress Test"
+echo -e "\n[PHASE 4] Extreme Scaling Stress Test"
 
-# ./assignment 1000000 128
-# ./assignment 1000000 256
-# ./assignment 1000000 512
+./assignment 1000000 128
+./assignment 1000000 256
+./assignment 1000000 512
 
 
 echo -e "\n--- CSV Reports Generated ---"
-# ls -lh *.csv
+ls -lh *.csv
 
 echo -e "\nBenchmarks complete."

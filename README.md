@@ -151,10 +151,12 @@ The application outputs the results of the comparison between the single-threade
     - **GPU Execution Time:** Total time including memory residency and kernel execution.
     - **Speedup Factor:** The calculated performance gain (ex: 8.55x).
 
+These were manually exported into CSV format and graphed with `plot_results.py`
+
 2. Validation & Export
 The program generates CSV reports (e.g., gpu_n1000000_b32_standard.csv) for every run. These files contain:
 
     - **ImageID:** Index of the CIFAR-10 image.
     - **ClusterID:** The final assigned cluster (0-9).
 
-These reports are designed to be imported into external tools for Principal Component Analysis (PCA) to visualize the high-dimensional clusters in a 2D space. (**COMING SOON**)
+These were post-processed in python with `compare.py` simply for correctness, not as a main part of the analysis for this project.
