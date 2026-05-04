@@ -7,7 +7,7 @@
 
 #define K 10
 #define DIM 3072
-#define ITER 20
+#define ITER 50
 #define NUM_STREAMS 4
 #define CHUNK_SIZE 50000
 #define WARP_SIZE 32
