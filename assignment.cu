@@ -422,11 +422,10 @@ __global__ void update_centroids_minibatch(
     int cluster_idx = blockIdx.x;
     
     // Bounds check and ensure the cluster had assigned points
-    if (cluster_idx >= K || cluster_counts[cluster_idx] == 0) {
-        return;
-    }
+    if (cluster_idx >= K) return;
 
     int count = cluster_counts[cluster_idx];
+    if (count == 0) count = 1;
 
     // Update each dimension for the given cluster
     for (int dim_idx = threadIdx.x; dim_idx < DIM; dim_idx += blockDim.x) {
@@ -644,7 +643,7 @@ void execute_kmeans_loop(float* d_data, float* d_centroids, int* d_labels,
     int blocks = (batch_size + block_size - 1) / block_size;
 
     for (int iteration = 0; iteration < ITER; iteration++) {
-        int offset = rand() % (num_samples - batch_size);
+        int offset = (iteration * batch_size) % (num_samples - batch_size);
 
         // Reset accumulators
         CUDA_CHECK(cudaMemset(d_centroid_sums, 0, K * DIM * sizeof(float)));
@@ -703,6 +702,8 @@ float gpu_kmeans_minibatch(const float* x, float* c, int* labels, int n,
     float elapsed_ms;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start_event, end_event));
 
+    CUDA_CHECK(cudaMemcpy(labels, d_labels, n * sizeof(int),
+                                                cudaMemcpyDeviceToHost));
     // Cleanup
     deallocate_kmeans_resources(d_data, d_centroids, d_labels, d_centroid_sums, 
                                                             d_centroid_counts);
