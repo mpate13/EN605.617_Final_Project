@@ -57,9 +57,9 @@ echo "Format: ./assignment <total_threads> <block_size> [--mini-batch]"
 
 # echo -e "\n[PHASE 2] Grid Scaling (Block Size = 256 fixed)"
 
-# ./assignment 1000 256
-# ./assignment 10000 256
-# ./assignment 50000 256
+./assignment 1000 256
+./assignment 10000 256
+./assignment 50000 256
 # ./assignment 100000 256
 # ./assignment 1000000 256
 
@@ -71,9 +71,9 @@ echo "Format: ./assignment <total_threads> <block_size> [--mini-batch]"
 
 # echo -e "\n[PHASE 3] Mini-Batch Scaling (Block Size = 256)"
 
-./assignment 1000 256 --mini-batch
-./assignment 10000 256 --mini-batch
-./assignment 50000 256 --mini-batch
+# ./assignment 1000 256 --mini-batch
+# ./assignment 10000 256 --mini-batch
+# ./assignment 50000 256 --mini-batch
 # ./assignment 100000 256 --mini-batch
 # ./assignment 1000000 256 --mini-batch
 
